@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ODM Gear Prototype</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; overflow: hidden; background: #000; }
+    canvas { display: block; }
+    #hud {
+      position: fixed; inset: 0; pointer-events: none;
+      font-family: "Segoe UI", system-ui, sans-serif; color: #e8e4da;
+      user-select: none;
+    }
+    #crosshair {
+      position: absolute; left: 50%; top: 50%; width: 6px; height: 6px;
+      margin: -3px 0 0 -3px; border-radius: 50%;
+      background: rgba(232, 228, 218, 0.9);
+      box-shadow: 0 0 4px rgba(0,0,0,0.6);
+    }
+    #reticle {
+      position: absolute; width: 26px; height: 26px; margin: -13px 0 0 -13px;
+      border: 2px solid #7fd47f; border-radius: 50%; display: none;
+      box-shadow: 0 0 6px rgba(0,0,0,0.5);
+    }
+    #reticle::after {
+      content: ""; position: absolute; left: 50%; top: 50%;
+      width: 4px; height: 4px; margin: -2px 0 0 -2px;
+      background: #7fd47f; border-radius: 50%;
+    }
+    #bars {
+      position: absolute; left: 24px; bottom: 24px; width: 260px;
+      display: flex; flex-direction: column; gap: 8px;
+    }
+    .bar { background: rgba(20, 22, 24, 0.65); border: 1px solid rgba(232,228,218,0.25); height: 18px; position: relative; }
+    .bar .fill { position: absolute; inset: 2px; transform-origin: left; }
+    .bar .label { position: absolute; left: 6px; top: 0; font-size: 11px; line-height: 18px; letter-spacing: 1px; text-shadow: 0 1px 2px #000; }
+    #health .fill { background: #b5493f; }
+    #gas .fill { background: #cfa94e; }
+    #blades { display: flex; gap: 4px; background: none; border: none; height: 14px; }
+    #blades .pip { flex: 1; background: rgba(20,22,24,0.65); border: 1px solid rgba(232,228,218,0.25); }
+    #blades .pip.on { background: #9fb4c4; }
+    #titans {
+      position: absolute; right: 24px; top: 20px; font-size: 15px; letter-spacing: 2px;
+      text-shadow: 0 1px 3px #000; text-align: right;
+    }
+    #speed {
+      position: absolute; right: 24px; bottom: 24px; font-size: 13px; letter-spacing: 1px;
+      color: rgba(232,228,218,0.75); text-shadow: 0 1px 2px #000;
+    }
+    #overlay {
+      position: absolute; inset: 0; display: flex; flex-direction: column;
+      align-items: center; justify-content: center; gap: 14px;
+      background: rgba(12, 14, 16, 0.78); pointer-events: auto; cursor: pointer;
+      text-align: center;
+    }
+    #overlay h1 { font-size: 30px; font-weight: 600; letter-spacing: 4px; }
+    #overlay .sub { font-size: 15px; color: #b8b2a6; max-width: 520px; line-height: 1.7; }
+    #overlay .go { margin-top: 10px; font-size: 14px; color: #7fd47f; letter-spacing: 2px; }
+    #toast {
+      position: absolute; left: 50%; top: 34%; transform: translateX(-50%);
+      font-size: 18px; letter-spacing: 2px; text-shadow: 0 2px 4px #000;
+      opacity: 0; transition: opacity 0.3s;
+    }
+    #vignette {
+      position: absolute; inset: 0; opacity: 0; transition: opacity 0.25s;
+      box-shadow: inset 0 0 140px rgba(160, 30, 20, 0.85);
+    }
+  </style>
+</head>
+<body>
+  <div id="hud">
+    <div id="vignette"></div>
+    <div id="crosshair"></div>
+    <div id="reticle"></div>
+    <div id="bars">
+      <div class="bar" id="health"><div class="fill"></div><span class="label">HEALTH</span></div>
+      <div class="bar" id="gas"><div class="fill"></div><span class="label">GAS</span></div>
+      <div id="blades" class="bar"></div>
+    </div>
+    <div id="titans"></div>
+    <div id="speed"></div>
+    <div id="toast"></div>
+    <div id="overlay">
+      <h1>ODM GEAR</h1>
+      <div class="sub">
+        WASD move &nbsp;·&nbsp; SHIFT sprint &nbsp;·&nbsp; SPACE jump<br/>
+        RIGHT MOUSE right hook &nbsp;·&nbsp; Q left hook &nbsp;·&nbsp; W/S reel in / out while hooked<br/>
+        SPACE while hooked near a rooftop = <b>vault onto the roof</b>, otherwise gas boost<br/>
+        Hook a titan <b>anywhere on its body</b>, reel past, LEFT MOUSE to slice the glowing nape<br/>
+        Refill gas &amp; blades at the glowing supply beacon
+      </div>
+      <div class="go">CLICK TO DEPLOY</div>
+    </div>
+  </div>
+  <script type="module" src="/src/main.js"></script>
+</body>
+</html>
