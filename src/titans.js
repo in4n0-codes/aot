@@ -13,8 +13,6 @@ float dNoise(vec3 x){ vec3 i = floor(x), f = fract(x); f = f * f * (3.0 - 2.0 * 
                  mix(dHash(i+vec3(0,1,1)),dHash(i+vec3(1,1,1)),f.x),f.y),f.z); }
 `;
 
-// Give a material a dissolve driven by a shared uniform (0 = intact, ~1 = gone),
-// with a glowing orange edge at the dissolving boundary.
 function patchDissolve(material, uDissolve) {
   material.onBeforeCompile = (shader) => {
     shader.uniforms.uDissolve = uDissolve;
@@ -36,24 +34,30 @@ function patchDissolve(material, uDissolve) {
 }
 
 export const TTUNE = {
-  detectRange: 40,
-  wanderSpeed: 0.55,
-  chaseSpeed: 0.95,   // a slow, heavy lumber — easy to outpace on foot
-  reactionDelay: 3.2, // long stare before it commits to the chase
-  turnRate: 0.1,      // extremely slow turn — time to locate, hook & slice the nape
+  detectRange: 52,
+  wanderSpeed: 2.2,     // roaming titans cover ground and spread out fast
+  chaseSpeed: 1.6,
+  travelMul: 2.8,       // far from its prey a titan strides; it slows up close
+  travelFar: 42,        // distance at which travelMul is in full effect
+  travelNear: 9,        // inside this it's back to a careful lumber
+  maxMove: 15,          // hard cap — even a sprinting abnormal tops out here
+  enterSpeed: 7.0,      // marching in through the breach
+  reactionDelay: 2.6,
+  turnRate: 0.1,        // base; each titan has its own turnMul
   grabRange: 3.8,
   grabDamage: 15,
   grabCooldown: 3.0,
-  slashRange: 11,       // reach at which the blade can connect with the nape
-  slashSpeedReq: 9,     // you need real momentum for the cut to land
-  napeCutRadius: 1.9,   // crosshair must pass this close to the nape point
-  slashRearDot: 0.45,   // free (uncabled) slashes must come from behind/beside
-  // Staged death timeline (seconds since the nape is cut). Each is a duration;
-  // the phases run back to back: still → knees → prone → steam → evaporate.
+  eatExposure: 3.0,     // linger near a titan this long and it grabs you
+  slashRange: 11,
+  slashSpeedReq: 9,
+  napeCutRadius: 1.9,
+  slashRearDot: 0.45,
+  budget: 30,           // total titans that invade; kill them all to win
+  maxActive: 14,        // concurrent cap — enough to fill the whole district
+  waveInterval: 14,     // seconds between waves through the hole
   death: { still: 2, kneel: 2, prone: 2, steam: 5, evap: 10 },
 };
 
-// Phase boundaries derived from the durations above.
 const D = TTUNE.death;
 const DEATH = {
   stillEnd: D.still,
@@ -62,7 +66,12 @@ const DEATH = {
   steamEnd: D.still + D.kneel + D.prone + D.steam,
   evapEnd: D.still + D.kneel + D.prone + D.steam + D.evap,
 };
-// smoothstep progress of `x` across [a,b]
+// Grab-and-eat timeline (seconds since grab)
+// Player gets eaten fast. NPCs are held aloft, thrashing, for several seconds
+// first — that's the window to fly over and cut the titan's nape to rescue.
+const EAT = { reach: 0.8, lift: 1.7, chomp: 2.2, done: 3.0 };
+const EAT_NPC = { reach: 1.4, lift: 4.5, chomp: 15.0, done: 16.0 };
+
 function seg(x, a, b) {
   const t = Math.max(0, Math.min(1, (x - a) / (b - a)));
   return t * t * (3 - 2 * t);
@@ -75,6 +84,7 @@ const _dir = new THREE.Vector3();
 const _close = new THREE.Vector3();
 const _fwd = new THREE.Vector3();
 const _head = new THREE.Vector3();
+const _hand = new THREE.Vector3();
 
 let nextId = 1;
 
@@ -86,16 +96,13 @@ function faceTexture(rand) {
   const ctx = c.getContext('2d');
   ctx.fillStyle = '#b59376';
   ctx.fillRect(0, 0, 128, 128);
-  // cheek/brow shading
   ctx.fillStyle = 'rgba(90,60,45,0.25)';
   ctx.beginPath(); ctx.ellipse(30, 66, 14, 20, 0.3, 0, Math.PI * 2); ctx.fill();
   ctx.beginPath(); ctx.ellipse(98, 66, 14, 20, -0.3, 0, Math.PI * 2); ctx.fill();
-  // heavy brow
   ctx.strokeStyle = '#5a3c2a';
   ctx.lineWidth = 5;
   ctx.beginPath(); ctx.moveTo(22, 38); ctx.lineTo(56, 34); ctx.stroke();
   ctx.beginPath(); ctx.moveTo(72, 34); ctx.lineTo(106, 38); ctx.stroke();
-  // eyes: wide whites, small dark iris (the vacant stare)
   for (const ex of [40, 88]) {
     ctx.fillStyle = '#e8e2d4';
     ctx.beginPath(); ctx.ellipse(ex, 50, 13, 9, 0, 0, Math.PI * 2); ctx.fill();
@@ -105,11 +112,9 @@ function faceTexture(rand) {
     ctx.lineWidth = 2;
     ctx.beginPath(); ctx.ellipse(ex, 50, 13, 9, 0, 0, Math.PI * 2); ctx.stroke();
   }
-  // nose shadow
   ctx.strokeStyle = 'rgba(90,60,45,0.55)';
   ctx.lineWidth = 3;
   ctx.beginPath(); ctx.moveTo(64, 54); ctx.lineTo(62, 74); ctx.stroke();
-  // grin: wide dark mouth with a row of flat teeth
   ctx.fillStyle = '#3c2620';
   ctx.beginPath();
   ctx.moveTo(18, 88);
@@ -139,10 +144,17 @@ class Titan {
     this.id = nextId++;
     this.h = height;
     this.abnormal = !!opts.abnormal;
-    this.girth = opts.girth || 1;           // <1 lean, >1 fat
-    this.napeHP = opts.napeHP || 1;         // abnormals take 2-3 nape cuts
-    this.speedMul = opts.speedMul || 1;     // abnormals move faster
-    this.staggerUntil = -1;                 // brief flinch after a non-lethal cut
+    this.girth = opts.girth || 1;
+    this.napeHP = opts.napeHP || 1;
+    this.speedMul = opts.speedMul || 1;
+    this.turnMul = opts.turnMul || 1;   // per-titan turning personality
+    this.staggerUntil = -1;
+    this.eating = null;                  // { kind, ref, setPos, t }
+    this.target = null;                  // { kind, ref } current chase target
+    this.retargetAIAt = 0;
+    this.stuckT = 0;                     // seconds it has failed to make progress
+    this.lastStuckPos = new THREE.Vector3(x, 0, z);
+    this.stuckCheckAt = 0;
     this.alive = true;
     this.dying = false;
     this.deadAt = -1;
@@ -153,18 +165,16 @@ class Titan {
     this.phase = rand() * 10;
     this.wanderTarget = new THREE.Vector3(x, 0, z);
     this.retargetAt = 0;
-    this.parts = []; // every mesh is a valid ODM anchor
+    this.parts = [];
 
-    // Per-titan appearance: skin tone, build, head/hair — every titan differs.
-    // Abnormals read ruddier and gaunt.
     const hue = this.abnormal ? 0.04 + (rand() - 0.5) * 0.02 : 0.065 + (rand() - 0.5) * 0.035;
     const sat = this.abnormal ? 0.42 : 0.26 + rand() * 0.14;
     const light = (this.abnormal ? 0.5 : 0.55) + (rand() - 0.5) * 0.14;
     const skin = new THREE.MeshLambertMaterial({ color: new THREE.Color().setHSL(hue, sat, light) });
     const skinDark = new THREE.MeshLambertMaterial({ color: new THREE.Color().setHSL(hue, sat + 0.03, light - 0.12) });
     const hairMat = new THREE.MeshLambertMaterial({ color: new THREE.Color().setHSL(0.02 + rand() * 0.1, 0.3 + rand() * 0.3, 0.1 + rand() * 0.22) });
-    const gir = this.girth;      // body-width multiplier for this titan
-    const headScale = 0.85 + rand() * 0.4; // some big-headed, some small
+    const gir = this.girth;
+    const headScale = 0.85 + rand() * 0.4;
 
     const g = new THREE.Group();
     this.group = g;
@@ -179,8 +189,6 @@ class Titan {
       return mesh;
     };
 
-    // Built at unit height (feet y=0, crown ~y=1.05), scaled by h.
-    // Long limbs, hunched back, oversized head — giant proportions.
     this.legs = [];
     for (const side of [-1, 1]) {
       const pivot = new THREE.Group();
@@ -195,22 +203,20 @@ class Titan {
       this.legs.push(pivot);
     }
 
-    // hips + hunched torso
     const hips = tag(new THREE.Mesh(new THREE.BoxGeometry(0.26, 0.14, 0.17), skinDark));
     hips.position.y = 0.53;
     g.add(hips);
     const torso = tag(new THREE.Mesh(new THREE.CapsuleGeometry(0.16, 0.24, 4, 10), skin));
     torso.position.set(0, 0.72, -0.01);
-    torso.rotation.x = 0.14; // hunch
+    torso.rotation.x = 0.14;
     torso.scale.set(1.15, 1, 0.8);
     g.add(torso);
-    // rib shading hint
     const chest = tag(new THREE.Mesh(new THREE.BoxGeometry(0.30, 0.16, 0.06), skin));
     chest.position.set(0, 0.80, 0.10);
     g.add(chest);
 
-    // shoulders + long arms with hands
     this.arms = [];
+    this.hands = [];
     for (const side of [-1, 1]) {
       const shoulder = tag(new THREE.Mesh(new THREE.SphereGeometry(0.075, 8, 6), skin));
       shoulder.position.set(side * 0.225, 0.86, 0);
@@ -226,14 +232,14 @@ class Titan {
       pivot.rotation.z = -side * 0.08;
       g.add(pivot);
       this.arms.push(pivot);
+      this.hands.push(hand);
     }
 
-    // neck + oversized head with the face
     const neck = tag(new THREE.Mesh(new THREE.CylinderGeometry(0.075, 0.09, 0.10, 8), skin));
     neck.position.set(0, 0.93, 0.01);
     g.add(neck);
     const faceMat = new THREE.MeshLambertMaterial({ map: faceTexture(rand) });
-    const headMats = [skin, skin, skin, skin, faceMat, skin]; // +z face forward
+    const headMats = [skin, skin, skin, skin, faceMat, skin];
     const head = tag(new THREE.Mesh(new THREE.BoxGeometry(0.21, 0.24, 0.21), headMats));
     head.position.set(0, 1.03, 0.02);
     head.scale.setScalar(headScale);
@@ -243,27 +249,24 @@ class Titan {
     hair.position.set(0, 1.13 + 0.02 * headScale, 0.01);
     hair.scale.set(headScale, 1, headScale);
     g.add(hair);
-    for (const side of [-1, 1]) { // ears
+    for (const side of [-1, 1]) {
       const ear = tag(new THREE.Mesh(new THREE.BoxGeometry(0.02, 0.06, 0.05), skin));
       ear.position.set(side * 0.115, 1.02, 0.02);
       g.add(ear);
     }
 
-    // THE NAPE — big, glowing, unmistakable, and a hook anchor.
     this.napeMat = new THREE.MeshBasicMaterial({ color: 0xd44a3a });
     this.nape = tag(new THREE.Mesh(new THREE.BoxGeometry(0.17, 0.14, 0.05), this.napeMat));
     this.nape.position.set(0, 0.92, -0.10);
     g.add(this.nape);
 
-    // Death dissolve: one shared uniform drives every material of this titan.
-    this.uDissolve = { value: -1.0 }; // < 0 while alive: nothing dissolves
+    this.uDissolve = { value: -1.0 };
     this.mats = [skin, skinDark, hairMat, faceMat, this.napeMat];
     for (const m of this.mats) patchDissolve(m, this.uDissolve);
 
-    this.wispAccum = 0;   // ambient steam emission accumulator
-    this.columnAccum = 0; // death-column emission accumulator
+    this.wispAccum = 0;
+    this.columnAccum = 0;
 
-    // Girth widens the build without changing height (fat vs lean titans).
     g.scale.set(height * gir, height, height * gir);
     scene.add(g);
     g.updateMatrixWorld(true);
@@ -273,16 +276,128 @@ class Titan {
     return this.nape.getWorldPosition(out);
   }
 
-  update(dt, time, player, colliders, onGrab, hookedToMe, steam) {
+  handWorld(out, side = 1) {
+    return this.hands[side].getWorldPosition(out);
+  }
+
+  // ---- Grab & eat: reach out, lift the victim to the mouth, chomp ----
+  startEat(kind, ref, setPos) {
+    if (this.eating || !this.alive) return false;
+    const T = kind === 'player' ? EAT : EAT_NPC;
+    this.eating = { kind, ref, setPos, t: 0, chomped: false, T };
+    ref.beingEaten = true;
+    ref.grabbedBy = this;
+    ref.grabbedAt = performance.now() / 1000;
+    return true;
+  }
+
+  updateEat(dt, time, steam, cbs) {
+    const e = this.eating;
+    const T = e.T;
+    e.t += dt;
+    // Arm reaches forward, then curls the hand up to the mouth.
+    const reach = seg(e.t, 0, T.reach);
+    const lift = seg(e.t, T.reach, T.lift);
+    const arm = this.arms[1];
+    arm.rotation.x = 1.5 * reach + 0.95 * lift; // forward, then up to the face
+    arm.rotation.z = -0.08 - 0.45 * lift;       // curl inward toward the mouth
+    this.head.rotation.x = 0.25 * lift;         // tilt down to meet the hand
+    this.arms[0].rotation.x = 0.4 * reach;
+
+    // The victim rides in the hand — thrashing if it's a helpless NPC.
+    this.handWorld(_hand, 1);
+    _hand.y -= 0.03 * this.h;
+    if (!e.chomped && e.kind !== 'player') {
+      _hand.x += Math.sin(time * 12) * 0.04 * this.h;
+    }
+    if (!e.chomped) e.setPos(_hand);
+
+    if (!e.chomped && e.t >= T.chomp) {
+      e.chomped = true;
+      if (cbs && cbs.onEaten) cbs.onEaten(e.kind, e.ref, this, _hand.clone());
+    }
+    if (e.t >= T.done) {
+      if (e.ref) e.ref.beingEaten = false;
+      this.eating = null;
+      this.head.rotation.x = 0;
+      this.arms[1].rotation.z = -0.08;
+      this.attackReadyAt = time + 1.2;
+    }
+  }
+
+  // Pick who to lumber after. Each victim is CLAIMED by exactly one titan —
+  // if someone is already being hunted, the others walk on past and find their
+  // own prey, which is what spreads them across the district.
+  pickTarget(time, player, npcs, mgr) {
+    if (time < this.retargetAIAt) return;
+    this.retargetAIAt = time + 0.6;
+    // Keep an existing, still-valid claim rather than thrashing.
+    if (this.target) {
+      const r = this.target.ref;
+      const stillOk = this.target.kind === 'player'
+        ? true
+        : (r.alive && !r.beingEaten);
+      if (stillOk && mgr.claimOwner(r) === this) return;
+    }
+    const gp = this.group.position;
+    let best = null, bestScore = Infinity;
+    const consider = (kind, ref, pos, weight, maxR) => {
+      if (!mgr.claimFree(ref, this)) return; // someone else already has them
+      const d = Math.hypot(pos.x - gp.x, pos.z - gp.z);
+      if (d > maxR) return;
+      const s = d * weight;
+      if (s < bestScore) { bestScore = s; best = { kind, ref }; }
+    };
+    consider('player', player, player.pos, 1.0, this.abnormal ? TTUNE.detectRange * 1.4 : TTUNE.detectRange);
+    if (npcs) {
+      for (const c of npcs.civilians) {
+        if (c.alive && !c.beingEaten) consider('civ', c, c.group.position, 0.7, TTUNE.detectRange * 1.6);
+      }
+      for (const s of npcs.scouts) {
+        if (s.alive && !s.beingEaten) consider('scout', s, s.group.position, 0.85, TTUNE.detectRange * 1.4);
+      }
+    }
+    mgr.releaseClaimsOf(this);
+    this.target = best;
+    if (best) mgr.setClaim(best.ref, this);
+  }
+
+  update(dt, time, player, colliders, onGrab, hookedToMe, steam, npcs, cbs, mgr) {
     if (this.dying) {
       this.updateDeath(dt, time, steam);
       return;
     }
-
-    // Ambient steam constantly wisps off a living titan's body.
     if (steam) this.emitWisps(dt, steam);
 
-    // Flinch after a non-lethal nape cut: it reels in place, nape flaring.
+    // Marching in through the breach — no targeting until it's inside.
+    if (this.entering) {
+      const gp = this.group.position;
+      _n.set(this.enterTarget.x - gp.x, 0, this.enterTarget.z - gp.z);
+      const d = _n.length();
+      _n.divideScalar(d || 1);
+      gp.addScaledVector(_n, Math.min(TTUNE.enterSpeed * this.speedMul, TTUNE.maxMove) * dt);
+      const yaw = Math.atan2(_n.x, _n.z);
+      let dy = yaw - this.group.rotation.y;
+      while (dy > Math.PI) dy -= Math.PI * 2;
+      while (dy < -Math.PI) dy += Math.PI * 2;
+      this.group.rotation.y += dy * Math.min(1, dt * 2);
+      this.phase += dt * 5;
+      const sw = Math.sin(this.phase) * 0.4;
+      this.legs[0].rotation.x = sw; this.legs[1].rotation.x = -sw;
+      this.arms[0].rotation.x = -sw * 0.65; this.arms[1].rotation.x = sw * 0.65;
+      gp.y = Math.abs(Math.sin(this.phase)) * 0.018 * this.h;
+      // Done the moment it's through the gate (inside the district), or after
+      // the deadline — it can never get stuck out at the wall.
+      if (gp.z < 104 || time > this.enterDeadline) this.entering = false;
+      return;
+    }
+
+    // Eating: rooted in place, nape wide open — the kill window.
+    if (this.eating) {
+      this.updateEat(dt, time, steam, cbs);
+      return;
+    }
+
     if (time < this.staggerUntil) {
       this.phase += dt * 8;
       this.group.rotation.z = Math.sin(this.phase) * 0.06;
@@ -291,8 +406,6 @@ class Titan {
     }
     this.group.rotation.z = 0;
 
-    // A titan with a cable in it staggers in place — it can't track you,
-    // which is the whole window for the zip-past nape kill.
     if (hookedToMe) {
       this.phase += dt * 5;
       const flail = Math.sin(this.phase) * 0.5;
@@ -302,21 +415,42 @@ class Titan {
       return;
     }
 
-    _toP.copy(player.pos).sub(this.group.position);
-    const distToPlayer = Math.hypot(_toP.x, _toP.z);
+    this.pickTarget(time, player, npcs, mgr);
 
-    // Abnormals spot you from further, barely pause, and charge fast.
-    const detect = this.abnormal ? TTUNE.detectRange * 1.4 : TTUNE.detectRange;
-    const reaction = this.abnormal ? TTUNE.reactionDelay * 0.25 : TTUNE.reactionDelay;
     let speed;
-    if (distToPlayer < detect) {
-      // Notice beat: it stops and stares before committing (brief for abnormals).
+    if (this.target) {
+      const tp = this.target.kind === 'player' ? player.pos : this.target.ref.group.position;
+      _toP.copy(tp).sub(this.group.position);
+      const reaction = this.abnormal ? TTUNE.reactionDelay * 0.25 : TTUNE.reactionDelay;
       if (!this.aggro) {
         if (this.aggroReadyAt === 0) this.aggroReadyAt = time + reaction;
         if (time >= this.aggroReadyAt) this.aggro = true;
       }
       _n.set(_toP.x, 0, _toP.z).normalize();
-      speed = (this.aggro ? TTUNE.chaseSpeed : 0) * this.speedMul;
+      // Stride while crossing the district, lumber once on top of the prey.
+      const far = Math.hypot(_toP.x, _toP.z);
+      const k = Math.max(0, Math.min(1, (far - TTUNE.travelNear) / (TTUNE.travelFar - TTUNE.travelNear)));
+      const travel = 1 + (TTUNE.travelMul - 1) * k;
+      speed = (this.aggro ? TTUNE.chaseSpeed : 0) * this.speedMul * travel;
+
+      // Snatch NPC prey with the hands when close enough.
+      const dist = Math.hypot(_toP.x, _toP.z);
+      const reach = TTUNE.grabRange + 0.06 * this.h;
+      if (this.target.kind !== 'player' && dist < reach && time > this.attackReadyAt) {
+        const ref = this.target.ref;
+        if (ref.alive && !ref.beingEaten && ref.group.position.y < this.h * 0.95) {
+          this.startEat(this.target.kind, ref, (v) => ref.group.position.copy(v));
+          this.target = null;
+          return;
+        }
+      }
+      // Player brushes: the swipe (damage + fling) stays; the full grab-and-eat
+      // is driven by the exposure timer in main.
+      if (this.target && this.target.kind === 'player' &&
+          dist < reach && player.pos.y < this.h * 0.55 && time > this.attackReadyAt) {
+        this.attackReadyAt = time + TTUNE.grabCooldown;
+        onGrab(this);
+      }
     } else {
       this.aggro = false;
       this.aggroReadyAt = 0;
@@ -327,14 +461,19 @@ class Titan {
         );
         this.retargetAt = time + 14 + Math.random() * 12;
       }
-      _n.copy(this.wanderTarget).sub(this.group.position).setY(0).normalize();
-      speed = TTUNE.wanderSpeed * this.speedMul;
+      _n.copy(this.wanderTarget).sub(this.group.position).setY(0);
+      const farW = _n.length();
+      _n.normalize();
+      // Stride toward distant wander goals too — this is what disperses them.
+      const kw = Math.max(0, Math.min(1, (farW - TTUNE.travelNear) / (TTUNE.travelFar - TTUNE.travelNear)));
+      speed = TTUNE.wanderSpeed * this.speedMul * (1 + (TTUNE.travelMul - 1) * kw);
     }
 
     // Step, but don't walk into buildings — try full move, then axis slides.
+    speed = Math.min(speed, TTUNE.maxMove);
     const px = this.group.position.x + _n.x * speed * dt;
     const pz = this.group.position.z + _n.z * speed * dt;
-    const r = 0.13 * this.h;
+    const r = 0.13 * this.h * this.girth;
     if (!this.blocked(px, pz, r, colliders)) {
       this.group.position.x = px;
       this.group.position.z = pz;
@@ -345,20 +484,39 @@ class Titan {
       this.group.position.z = pz;
       this.retargetAt = Math.min(this.retargetAt, time + 1);
     } else {
-      this.retargetAt = time; // fully stuck: pick a new destination
+      this.retargetAt = time;
     }
     this.group.position.x = Math.max(-105, Math.min(105, this.group.position.x));
-    this.group.position.z = Math.max(-105, Math.min(105, this.group.position.z));
+    this.group.position.z = Math.max(-105, Math.min(104, this.group.position.z));
 
-    // Ponderous turn (forward is +z) — abnormals wheel around much quicker.
+    // Anti-stuck: if it wants to move (speed>0) but has barely progressed for a
+    // while, it's wedged — pick the clearest escape direction and shove out.
+    if (time > this.stuckCheckAt) {
+      const moved = this.group.position.distanceTo(this.lastStuckPos);
+      if (speed > 0.5 && moved < 1.2) {
+        this.stuckT += time - (this.stuckCheckAt - 0.5);
+      } else {
+        this.stuckT = 0;
+      }
+      this.lastStuckPos.copy(this.group.position);
+      this.stuckCheckAt = time + 0.5;
+      if (this.stuckT > 1.4) {
+        this.escapeStuck(colliders);
+        this.stuckT = 0;
+        // Head somewhere open and far so it doesn't re-wedge instantly.
+        this.wanderTarget.set((Math.random() - 0.5) * 170, 0, (Math.random() - 0.5) * 170);
+        this.retargetAt = time + 8;
+        this.target = null;
+      }
+    }
+
+    // Ponderous turn (forward is +z), personality via turnMul.
     const targetYaw = Math.atan2(_n.x, _n.z);
     let dy = targetYaw - this.group.rotation.y;
     while (dy > Math.PI) dy -= Math.PI * 2;
     while (dy < -Math.PI) dy += Math.PI * 2;
-    const turn = TTUNE.turnRate * (this.abnormal ? 3.5 : 1);
-    this.group.rotation.y += dy * Math.min(1, dt * turn);
+    this.group.rotation.y += dy * Math.min(1, dt * TTUNE.turnRate * this.turnMul);
 
-    // Lumbering gait.
     this.phase += dt * Math.max(speed, 0.2) * 1.7;
     const swing = Math.sin(this.phase) * 0.38;
     this.legs[0].rotation.x = swing;
@@ -367,16 +525,7 @@ class Titan {
     this.arms[1].rotation.x = swing * 0.65;
     this.group.position.y = Math.abs(Math.sin(this.phase)) * 0.018 * this.h;
 
-    // Nape pulse so it reads as the weak point.
     this.napeMat.color.setHSL(0.02, 0.75, 0.45 + 0.15 * Math.sin(time * 5 + this.id));
-
-    // Grab: only if you're low — rooftops and cables are safe.
-    if (distToPlayer < TTUNE.grabRange + 0.06 * this.h &&
-        player.pos.y < this.h * 0.55 &&
-        time > this.attackReadyAt) {
-      this.attackReadyAt = time + TTUNE.grabCooldown;
-      onGrab(this);
-    }
   }
 
   blocked(x, z, r, colliders) {
@@ -386,7 +535,31 @@ class Titan {
     return false;
   }
 
-  // Faint wisps rising off the body — the signature idle VFX.
+  // Wedged between buildings: probe 16 directions and slide out along the one
+  // with the most open room, so no titan can ever stay stuck.
+  escapeStuck(colliders) {
+    const gp = this.group.position;
+    const r = 0.13 * this.h * this.girth;
+    let bestDir = null, bestClear = -1;
+    for (let i = 0; i < 16; i++) {
+      const a = (i / 16) * Math.PI * 2;
+      const dx = Math.sin(a), dz = Math.cos(a);
+      let clear = 0;
+      for (let s = 2; s <= 26; s += 2) {
+        if (this.blocked(gp.x + dx * s, gp.z + dz * s, r, colliders)) break;
+        clear = s;
+      }
+      if (clear > bestClear) { bestClear = clear; bestDir = [dx, dz]; }
+    }
+    if (bestDir && bestClear > 0) {
+      const step = Math.min(bestClear, 5);
+      gp.x += bestDir[0] * step;
+      gp.z += bestDir[1] * step;
+      gp.x = Math.max(-105, Math.min(105, gp.x));
+      gp.z = Math.max(-105, Math.min(104, gp.z));
+    }
+  }
+
   emitWisps(dt, steam) {
     this.wispAccum += dt * 9;
     const gp = this.group.position, h = this.h;
@@ -398,67 +571,44 @@ class Titan {
       steam.emit(
         px, py, pz,
         (Math.random() - 0.5) * 1.2, 0.5 + Math.random() * 1.2, (Math.random() - 0.5) * 1.2,
-        1.1 + Math.random() * 0.9,          // life
-        0.06 * h + Math.random() * 0.05 * h, // size
-        0.05 * h,                            // grow
-        0.7,                                 // buoyancy
-        0.16,                                // peak alpha (faint)
+        1.1 + Math.random() * 0.9,
+        0.06 * h + Math.random() * 0.05 * h,
+        0.05 * h, 0.7, 0.16,
         0.85, 0.86, 0.82
       );
     }
   }
 
-  // Long staged death (td = seconds since the nape was cut):
-  //   still (stand) → knees → face-down → steam release → slow evaporation.
   updateDeath(dt, time, steam) {
     const td = time - this.deadAt;
     const h = this.h;
-
-    // --- Pose through the phases ---
-    const pKneel = seg(td, DEATH.stillEnd, DEATH.kneelEnd); // 0..1 buckling
-    const pProne = seg(td, DEATH.kneelEnd, DEATH.proneEnd); // 0..1 tipping flat
-    // Turn to topple toward open ground (chosen on death), so the body doesn't
-    // fall through a house.
+    const pKneel = seg(td, DEATH.stillEnd, DEATH.kneelEnd);
+    const pProne = seg(td, DEATH.kneelEnd, DEATH.proneEnd);
     let dyaw = this.fallYaw - this.startYaw;
     while (dyaw > Math.PI) dyaw -= Math.PI * 2;
     while (dyaw < -Math.PI) dyaw += Math.PI * 2;
     this.group.rotation.y = this.startYaw + dyaw * seg(td, 0, DEATH.kneelEnd);
-    // Pitch forward: upright → ~40° on the knees → ~90° face-down.
     const pitch = 0.7 * pKneel + (Math.PI / 2 - 0.7) * pProne;
     this.group.rotation.x = pitch;
     this.group.rotation.z = this.fallRoll * pKneel;
-    // Sink onto the knees, then lift so the prone body rests ON the road
-    // rather than sinking half into it (torso radius ≈ 0.16h).
     this.group.position.y = -0.08 * h * pKneel * (1 - pProne) + 0.17 * h * pProne;
-    // Legs fold under while kneeling, then splay straight when prone.
     const legFold = 1.15 * pKneel * (1 - pProne);
     this.legs[0].rotation.x = legFold;
     this.legs[1].rotation.x = legFold * 0.85;
-    // Arms hang limp throughout.
     for (const a of this.arms) a.rotation.x += (0.2 - a.rotation.x) * Math.min(1, dt * 4);
 
-    // --- Dissolve: only during the final evaporation window ---
     this.uDissolve.value = Math.max(-1, Math.min(1.05,
       (td - DEATH.steamEnd) / (DEATH.evapEnd - DEATH.steamEnd)));
 
-    // --- Steam ---
     if (steam) {
       const gp = this.group.position;
-      if (td < DEATH.proneEnd) {
-        // Faint cooling wisps while it collapses.
-        this.columnAccum += dt * 16;
-      } else {
-        // Big release once it's down, sustained through the evaporation.
-        const evap = td > DEATH.steamEnd;
-        this.columnAccum += dt * (evap ? 95 : 130);
-      }
-      // Emit along the body — a vertical-ish plume from the fallen mass.
+      if (td < DEATH.proneEnd) this.columnAccum += dt * 16;
+      else this.columnAccum += dt * (td > DEATH.steamEnd ? 95 : 130);
       const prone = td >= DEATH.proneEnd;
       while (this.columnAccum >= 1) {
         this.columnAccum -= 1;
         const rad = Math.random() * 0.3 * h;
         const ang = Math.random() * Math.PI * 2;
-        // When prone the body lies forward (+ its facing), so spread along it.
         const spread = prone ? 0.5 * h : 0.2 * h;
         const bx = gp.x + (Math.random() - 0.5) * spread;
         const bz = gp.z + (Math.random() - 0.5) * spread;
@@ -483,16 +633,24 @@ class Titan {
     this.dying = true;
     this.deadAt = time;
     this.napeMat.color.set(0x2a2a2a);
-    this.fallRoll = (Math.random() - 0.5) * 0.2; // slight lean as it goes down
+    this.fallRoll = (Math.random() - 0.5) * 0.2;
     this.startYaw = this.group.rotation.y;
     this.fallYaw = colliders ? this.pickFallYaw(colliders) : this.startYaw;
+    // Anyone in its hand is dropped — killing an eater RESCUES the victim.
+    if (this.eating) {
+      const e = this.eating;
+      if (e.ref && !e.chomped) {
+        e.ref.beingEaten = false;
+        e.ref.justFreed = true;
+      }
+      this.eating = null;
+    }
+    this.head.rotation.x = 0;
   }
 
-  // Choose the clearest horizontal direction to topple into, so the prone
-  // body lands in an open lane instead of clipping through a building.
   pickFallYaw(colliders) {
     const base = this.group.position;
-    const reach = this.h * 0.9; // how far the fallen body reaches
+    const reach = this.h * 0.9;
     let bestYaw = this.group.rotation.y, best = -1;
     for (let i = 0; i < 16; i++) {
       const ang = (i / 16) * Math.PI * 2;
@@ -514,61 +672,124 @@ export class TitanManager {
     this.odm = odm;
     this.hud = hud;
     this.titans = [];
-    this.steam = new SteamSystem(scene);
+    this.steam = new SteamSystem(scene, 1600);
     this.kills = 0;
-    world.titanBodies = []; // living-titan cylinders, refreshed each frame
+    this.spawned = 0;
+    this.nextWaveAt = Infinity; // armed by the breach cinematic
+    this.claims = new Map();    // victim ref -> the one titan hunting them
+    world.titanBodies = [];
 
-    // mulberry32 — a plain Lehmer LCG showed lattice correlation at the fixed
-    // per-titan draw stride, which made every titan the same height.
+    // Roughly every 4th arrival is an ABNORMAL (≈10 of 40), alternating 2/3
+    // nape cuts. Some of them run.
+    this.abnormalOrder = new Set();
+    for (let i = 2; i < TTUNE.budget; i += 4) this.abnormalOrder.add(i);
+    this.abSeen = 0;
+
     let seed = 0x5eed1234;
-    const rand = () => {
+    this.rand = () => {
       seed |= 0; seed = (seed + 0x6D2B79F5) | 0;
       let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
       t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
       return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
     };
-    // 10 titans spread around the district. 4 are ABNORMALS (faster, tougher —
-    // 2-3 nape cuts — and quicker to turn); the other 6 are all different:
-    // varied height, girth, skin tone and head size.
-    const spots = [
-      [52, 6], [-52, -6], [6, -52], [-6, 52],
-      [78, 26], [-78, -26], [26, 78], [-26, -78],
-      [52, -52], [-52, 52],
-    ];
-    // Which indices are abnormal (spread them out).
-    const abnormalIdx = new Set([0, 3, 5, 8]);
-    let abSeen = 0;
-    for (let i = 0; i < spots.length; i++) {
-      const [x, z] = spots[i];
-      const abnormal = abnormalIdx.has(i);
-      let opts, h;
-      if (abnormal) {
-        h = 12 + rand() * 4;                 // 12-16
-        opts = {
-          abnormal: true,
-          girth: 0.8 + rand() * 0.15,        // gaunt
-          napeHP: 2 + (abSeen++ % 2),        // alternate 2 and 3 cuts
-          speedMul: 1.7 + rand() * 0.5,      // clearly faster
-        };
-      } else {
-        h = 9 + rand() * 8;                  // 9-17: big variety
-        opts = { girth: 0.8 + rand() * 0.7 };// lean to fat
+    // A grid of home sectors covering the WHOLE district (never the plaza), so
+    // each arrival strides off to a different quarter of Shiganshina.
+    this.sectors = [];
+    for (const sx of [-85, -55, -25, 25, 55, 85]) {
+      for (const sz of [-85, -50, -15, 20, 55, 90]) {
+        if (Math.abs(sx) < 30 && Math.abs(sz) < 30) continue; // keep the plaza clear
+        this.sectors.push([sx, sz]);
       }
-      const t = new Titan(scene, x, z, h, rand, opts);
-      // Safety: if a jittered building landed on the spot, nudge outward.
-      let guard = 0;
-      while (t.blocked(t.group.position.x, t.group.position.z, 0.2 * h * t.girth, world.colliders) && guard++ < 30) {
-        t.group.position.x *= 1.07;
-        t.group.position.z *= 1.07;
-      }
-      t.group.updateMatrixWorld(true);
-      this.titans.push(t);
-      for (const m of t.parts) odm.addTarget(m); // hook anywhere on the body
     }
+    // Shuffle deterministically so consecutive spawns diverge.
+    for (let i = this.sectors.length - 1; i > 0; i--) {
+      const j = (this.rand() * (i + 1)) | 0;
+      [this.sectors[i], this.sectors[j]] = [this.sectors[j], this.sectors[i]];
+    }
+    this.sectorPick = 0;
+  }
+
+  // The wall is breached — titans start pouring in.
+  beginInvasion(time) {
+    if (this.nextWaveAt === Infinity) this.nextWaveAt = time;
+  }
+
+  // ---- target claims: exactly one titan per victim ----
+  claimOwner(ref) {
+    const t = this.claims.get(ref);
+    if (t && (!t.alive || t.dying)) { this.claims.delete(ref); return null; }
+    return t || null;
+  }
+
+  claimFree(ref, titan) {
+    const owner = this.claimOwner(ref);
+    return !owner || owner === titan;
+  }
+
+  setClaim(ref, titan) { this.claims.set(ref, titan); }
+
+  releaseClaimsOf(titan) {
+    for (const [ref, t] of this.claims) if (t === titan) this.claims.delete(ref);
+  }
+
+  aliveCount() {
+    return this.titans.filter((t) => t.alive).length;
   }
 
   remaining() {
-    return this.titans.filter((t) => t.alive).length;
+    return TTUNE.budget - this.kills;
+  }
+
+  spawnWave(time) {
+    const rand = this.rand;
+    const count = Math.min(
+      5 + ((rand() * 4) | 0),                 // 5-8 per wave
+      TTUNE.budget - this.spawned,
+      TTUNE.maxActive - this.aliveCount()
+    );
+    const hole = this.world.hole || { x: 0, z: 108 };
+    for (let i = 0; i < count; i++) {
+      const idx = this.spawned;
+      const abnormal = this.abnormalOrder.has(idx);
+      let opts, h;
+      if (abnormal) {
+        h = 12 + rand() * 4;
+        // A few of them are near-sprinting runners.
+        const runner = rand() < 0.45;
+        opts = {
+          abnormal: true,
+          girth: 0.78 + rand() * 0.15,
+          napeHP: 2 + (this.abSeen++ % 2),
+          speedMul: runner ? 2.6 + rand() * 0.7 : 2.0 + rand() * 0.4,
+          turnMul: 1.7 + rand() * 0.6,   // quicker, but nape still takeable
+        };
+      } else {
+        h = 9 + rand() * 8;
+        opts = {
+          girth: 0.8 + rand() * 0.7,
+          speedMul: 0.85 + rand() * 0.6, // every titan lumbers differently
+          turnMul: 0.7 + rand() * 0.7,
+        };
+      }
+      // Spawn just OUTSIDE the hole, lined up to walk straight through it, then
+      // strike out for a UNIQUE home sector deep in the district.
+      const lane = (i - (count - 1) / 2) * 3.2 + (rand() - 0.5) * 1.5; // stay within the ~24-wide hole
+      const t = new Titan(this.scene, hole.x + lane, 117 + i * 3.5 + rand() * 3, h, rand, opts);
+      t.group.rotation.y = Math.PI; // facing the city (-z)
+      t.entering = true;
+      t.enterDeadline = time + 9; // hard cap so nobody can get stuck at the gate
+      t.enterTarget = new THREE.Vector3(hole.x + lane, 0, 100); // straight in
+      const sector = this.sectors[this.sectorPick++ % this.sectors.length];
+      t.homeSector = new THREE.Vector3(sector[0] + (rand() - 0.5) * 22, 0, sector[1] + (rand() - 0.5) * 22);
+      t.wanderTarget.copy(t.homeSector);
+      t.retargetAt = time + 30 + rand() * 20;
+      t.group.updateMatrixWorld(true);
+      this.titans.push(t);
+      for (const m of t.parts) this.odm.addTarget(m);
+      this.spawned++;
+    }
+    this.nextWaveAt = time + TTUNE.waveInterval;
+    return count;
   }
 
   hookedGroups() {
@@ -579,13 +800,18 @@ export class TitanManager {
     return groups;
   }
 
-  update(dt, time, player, onGrab) {
+  update(dt, time, player, onGrab, npcs, cbs) {
+    // Waves keep coming while the budget lasts.
+    if (this.spawned < TTUNE.budget && time >= this.nextWaveAt &&
+        this.aliveCount() < TTUNE.maxActive) {
+      this.spawnWave(time);
+    }
+
     const hooked = this.hookedGroups();
     const bodies = this.world.titanBodies;
     bodies.length = 0;
     for (const t of this.titans) {
       if (t.dying && time - t.deadAt > DEATH.evapEnd + 0.5) {
-        // Fully evaporated — remove and free its resources.
         this.scene.remove(t.group);
         t.dying = false;
         t.group.traverse((o) => { if (o.geometry) o.geometry.dispose(); });
@@ -593,23 +819,188 @@ export class TitanManager {
         continue;
       }
       if (t.alive || t.dying) {
-        t.update(dt, time, player, this.world.colliders, onGrab, hooked.includes(t.group), this.steam);
+        t.update(dt, time, player, this.world.colliders, onGrab,
+          hooked.includes(t.group), this.steam, npcs, cbs, this);
       }
-      // Only living titans are solid bodies the player can't pass through.
-      if (t.alive) {
+      if (t.alive && !t.entering) {
         bodies.push({ x: t.group.position.x, z: t.group.position.z, r: 0.17 * t.h * t.girth, top: t.h });
       }
     }
+
+    // Titans never overlap: pairwise push-apart on the walkers.
+    const live = this.titans.filter((t) => t.alive && !t.eating && !t.entering);
+    for (let i = 0; i < live.length; i++) {
+      for (let j = i + 1; j < live.length; j++) {
+        const a = live[i].group.position, b = live[j].group.position;
+        const ra = 0.15 * live[i].h * live[i].girth, rb = 0.15 * live[j].h * live[j].girth;
+        const dx = b.x - a.x, dz = b.z - a.z;
+        const d = Math.hypot(dx, dz), minD = ra + rb;
+        if (d < minD && d > 0.001) {
+          const push = (minD - d) / 2;
+          const nx = dx / d, nz = dz / d;
+          a.x -= nx * push; a.z -= nz * push;
+          b.x += nx * push; b.z += nz * push;
+        }
+      }
+    }
+
+    // Titan bodies are solid against architecture: after every move (incl.
+    // the push-apart above), shove any titan overlapping a building back out.
+    for (const t of this.titans) {
+      if (t.alive) this.resolveBuildings(t);
+    }
+
     this.steam.update(dt);
   }
 
-  // Steam-and-blood burst at the nape the instant the blade connects.
+  // Circle-vs-AABB resolution so a titan's body can never sink into a house.
+  resolveBuildings(t) {
+    const p = t.group.position;
+    const r = 0.16 * t.h * t.girth;
+    for (const b of this.world.colliders) {
+      if (b.max.y < 4 || b.min.y > 2) continue; // stones they step over; lintels overhead
+      const cx = Math.max(b.min.x, Math.min(p.x, b.max.x));
+      const cz = Math.max(b.min.z, Math.min(p.z, b.max.z));
+      const dx = p.x - cx, dz = p.z - cz;
+      const d2 = dx * dx + dz * dz;
+      if (d2 >= r * r) continue;
+      if (d2 < 1e-6) {
+        // Centre is inside the box: exit along the shallowest face.
+        const exL = p.x - b.min.x, exR = b.max.x - p.x;
+        const ezL = p.z - b.min.z, ezR = b.max.z - p.z;
+        const m = Math.min(exL, exR, ezL, ezR);
+        if (m === exL) p.x = b.min.x - r;
+        else if (m === exR) p.x = b.max.x + r;
+        else if (m === ezL) p.z = b.min.z - r;
+        else p.z = b.max.z + r;
+      } else {
+        const d = Math.sqrt(d2);
+        p.x = cx + (dx / d) * r;
+        p.z = cz + (dz / d) * r;
+      }
+    }
+  }
+
+  // Nearest titan that could snatch the player right now (for the exposure timer).
+  nearestGrabber(player, time) {
+    const hooked = this.hookedGroups();
+    let best = null, bestD = Infinity;
+    for (const t of this.titans) {
+      if (!t.alive || t.dying || t.eating) continue;
+      if (time < t.staggerUntil) continue;
+      if (hooked.includes(t.group)) continue;
+      const d = Math.hypot(player.pos.x - t.group.position.x, player.pos.z - t.group.position.z);
+      if (d < TTUNE.grabRange * 1.2 + 0.06 * t.h && player.pos.y < t.h * 0.8 && d < bestD) {
+        bestD = d; best = t;
+      }
+    }
+    return best;
+  }
+
+  startEatPlayer(t, player) {
+    return t.startEat('player', player, (v) => {
+      player.pos.copy(v);
+      player.vel.set(0, 0, 0);
+    });
+  }
+
+  finishKill(t, time) {
+    t.kill(time, this.world.colliders);
+    this.releaseClaimsOf(t); // its prey is free to be hunted by someone else
+    this.kills++;
+    for (const m of t.parts) this.odm.removeTarget(m);
+    for (const hk of [this.odm.left, this.odm.right]) {
+      if (hk.followRoot === t.group) this.odm.release(hk);
+    }
+  }
+
+  // A scout dives the nape. Outcomes: cut/kill, miss, or CAUGHT.
+  scoutCut(t, scout, time) {
+    if (!t.alive) return 'miss';
+    t.napeWorld(_n);
+    const open = t.eating || time < t.staggerUntil;
+    // Scouts are much weaker than the player: they mostly harass and only
+    // finish an easy (distracted) titan. Cutting a healthy nape is rare.
+    const cutChance = open ? 0.4 : (t.abnormal ? 0.02 : 0.045);
+    const r = Math.random();
+    if (r < cutChance) {
+      this.napeBurst(_n);
+      t.napeHP -= 1;
+      if (t.napeHP <= 0) {
+        this.finishKill(t, time);
+        return 'kill';
+      }
+      t.staggerUntil = time + 0.7;
+      return 'hit';
+    }
+    if (!open && Math.random() < 0.02 && !t.eating) {
+      if (t.startEat('scout', scout, (v) => scout.group.position.copy(v))) return 'caught';
+    }
+    return 'miss';
+  }
+
+  // Returns 'kill' | 'hit' | 'slow' | 'body' | null.
+  trySlash(camera, player, time) {
+    _v.setFromMatrixPosition(camera.matrixWorld);
+    const viewDir = camera.getWorldDirection(_dir);
+    const hooked = this.hookedGroups();
+    let bodyHit = false;
+    for (const t of this.titans) {
+      if (!t.alive) continue;
+      const zipAttached = hooked.includes(t.group);
+      const range = zipAttached ? TTUNE.slashRange * 1.3 : TTUNE.slashRange;
+      t.napeWorld(_n);
+
+      _toP.copy(_n).sub(_v);
+      const along = _toP.dot(viewDir);
+      if (along <= 0 || along > range) {
+        if (_toP.length() < range * 1.15) bodyHit = true;
+        continue;
+      }
+      _close.copy(_v).addScaledVector(viewDir, along);
+      const perp = _n.distanceTo(_close);
+
+      if (perp > TTUNE.napeCutRadius) {
+        if (perp < TTUNE.napeCutRadius + 0.09 * t.h) bodyHit = true;
+        continue;
+      }
+      t.head.getWorldPosition(_head);
+      _toP.copy(_head).sub(_v);
+      const headAlong = _toP.dot(viewDir);
+      _close.copy(_v).addScaledVector(viewDir, headAlong);
+      if (_head.distanceTo(_close) < perp) { bodyHit = true; continue; }
+
+      // A distracted (eating) titan is fair game from any angle; otherwise
+      // free slashes must come from behind/beside.
+      if (!zipAttached && !t.eating) {
+        t.group.getWorldDirection(_fwd);
+        _toP.copy(_v).sub(_n).normalize();
+        if (_toP.dot(_fwd) > TTUNE.slashRearDot) { bodyHit = true; continue; }
+      }
+
+      if (player.vel.length() < TTUNE.slashSpeedReq) return 'slow';
+      this.napeBurst(_n);
+      t.napeHP -= 1;
+      if (t.napeHP > 0) {
+        t.staggerUntil = time + 0.7;
+        this.lastHit = { pos: _n.clone(), titan: t, remaining: t.napeHP };
+        return 'hit';
+      }
+      // Killing a titan mid-bite (before the chomp) RESCUES the victim.
+      const rescued = t.eating && !t.eating.chomped ? t.eating.kind : null;
+      this.finishKill(t, time);
+      this.lastKill = { pos: _n.clone(), titan: t, rescued };
+      return 'kill';
+    }
+    return bodyHit ? 'body' : null;
+  }
+
   napeBurst(at) {
     for (let i = 0; i < 46; i++) {
       const dir = new THREE.Vector3(
         (Math.random() - 0.5) * 2, Math.random() * 1.4 + 0.2, (Math.random() - 0.5) * 2
       ).normalize().multiplyScalar(5 + Math.random() * 11);
-      const blood = i < 14; // a few dark-red flecks amid the steam
+      const blood = i < 14;
       this.steam.emit(
         at.x, at.y, at.z,
         dir.x, dir.y, dir.z,
@@ -625,73 +1016,14 @@ export class TitanManager {
     }
   }
 
-  // Returns 'kill' | 'slow' | null. Call when the player slashes.
-  // Returns 'kill' | 'slow' | 'body' | null.
-  // The blade only kills when the crosshair ray actually passes through the
-  // nape — hitting the torso, limbs, or head does nothing.
-  trySlash(camera, player, time) {
-    _v.setFromMatrixPosition(camera.matrixWorld);
-    const viewDir = camera.getWorldDirection(_dir);
-    const hooked = this.hookedGroups();
-    let bodyHit = false; // aimed at a titan but missed the nape
-    for (const t of this.titans) {
-      if (!t.alive) continue;
-      const zipAttached = hooked.includes(t.group);
-      const range = zipAttached ? TTUNE.slashRange * 1.3 : TTUNE.slashRange;
-      t.napeWorld(_n);
-
-      // Ray vs. nape: how close does the crosshair line pass to the nape point?
-      _toP.copy(_n).sub(_v);
-      const along = _toP.dot(viewDir); // distance to nape projected onto aim ray
-      if (along <= 0 || along > range) {
-        if (_toP.length() < range * 1.15) bodyHit = true; // nape behind/too far
-        continue;
-      }
-      _close.copy(_v).addScaledVector(viewDir, along); // closest point on ray
-      const perp = _n.distanceTo(_close);              // miss distance to nape
-
-      if (perp > TTUNE.napeCutRadius) {
-        // Crosshair is on the titan somewhere, just not the nape.
-        if (perp < TTUNE.napeCutRadius + 0.09 * t.h) bodyHit = true;
-        continue;
-      }
-      // The nape must be the part you're actually pointing at — if the head
-      // (right above it) is nearer the crosshair line, that's a head hit.
-      t.head.getWorldPosition(_head);
-      _toP.copy(_head).sub(_v);
-      const headAlong = _toP.dot(viewDir);
-      _close.copy(_v).addScaledVector(viewDir, headAlong);
-      if (_head.distanceTo(_close) < perp) { bodyHit = true; continue; }
-
-      // Free (uncabled) slashes must come from behind/beside so the blade
-      // doesn't reach the nape straight through the face. A cabled fly-past
-      // may connect from any angle — the titan is pinned and staggering.
-      if (!zipAttached) {
-        t.group.getWorldDirection(_fwd);
-        _toP.copy(_v).sub(_n).normalize();
-        if (_toP.dot(_fwd) > TTUNE.slashRearDot) { bodyHit = true; continue; }
-      }
-
-      if (player.vel.length() < TTUNE.slashSpeedReq) return 'slow';
-      this.napeBurst(_n);
-      t.napeHP -= 1;
-      if (t.napeHP > 0) {
-        // Abnormal took the hit but isn't dead — it flinches, cut again.
-        t.staggerUntil = time + 0.7;
-        this.lastHit = { pos: _n.clone(), titan: t, remaining: t.napeHP };
-        return 'hit';
-      }
-      t.kill(time, this.world.colliders);
-      this.kills++;
-      for (const m of t.parts) this.odm.removeTarget(m);
-      // Release any cable still latched to this titan (it follows the group now).
-      for (const hk of [this.odm.left, this.odm.right]) {
-        if (hk.followRoot === t.group) this.odm.release(hk);
-      }
-      this.lastKill = { pos: _n.clone(), titan: t };
-      return 'kill';
+  // Red splash where someone was eaten or crushed.
+  gorePuff(p) {
+    for (let i = 0; i < 22; i++) {
+      const d = new THREE.Vector3(
+        (Math.random() - 0.5) * 2, Math.random(), (Math.random() - 0.5) * 2
+      ).normalize().multiplyScalar(3 + Math.random() * 6);
+      this.steam.emit(p.x, p.y, p.z, d.x, d.y, d.z,
+        0.5 + Math.random() * 0.4, 0.6, 0.3, -2, 0.9, 0.55, 0.06, 0.05);
     }
-    return bodyHit ? 'body' : null;
   }
-
 }

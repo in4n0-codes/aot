@@ -43,10 +43,20 @@ Open the printed URL (default `http://localhost:5174`) and click to deploy.
 - Everything costs **gas**: firing, holding, reeling, boosting. Run dry and
   the cables drop you. Blades dull after 6 swings.
 - Stand in the green beacon ring in the plaza to refill gas, blades, health.
-- Titans wander until they spot you, **stare for ~3 seconds**, then lumber in
-  at walking pace. Getting grabbed hurts and flings you; at 0 HP you respawn
-  at the supply point. They can only grab you near the ground — rooftops and
-  cables are safe.
+- The game opens with a **breach**: a colossal giant kicks a hole in the south
+  wall and 20 titans invade in waves through the gap (press Enter to skip the
+  intro). Kill all 20 to win.
+- **Allied scouts** (4) fly the district on their own gear harassing titans,
+  and **civilians** flee through the streets. Titans chase whoever is closest —
+  a titan busy grabbing someone is rooted and its nape is wide open. If a titan
+  catches a scout or civilian in its hand, you have ~2 seconds to cut its nape
+  and **rescue** them mid-bite. Your win rating (1-3 stars) depends on how many
+  scouts survive.
+- Titans wander until they spot a target, **stare for a beat**, then lumber in —
+  every titan at its own pace. Brushing one hurts and flings you; **linger in
+  grab range for ~3 seconds and it will pick you up and eat you** (screen
+  shakes, you're carried to the mouth — then you respawn at the supply point).
+  Rooftops and cables are safe.
 - **The signature kill:** hook a titan **anywhere on its body** (the reticle
   turns red on titan flesh). A cabled titan staggers and *cannot turn to face
   you*. Reel in with W, fly past, and slash — while attached, any hit near

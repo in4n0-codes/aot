@@ -41,6 +41,76 @@ export function setGas(on) {
   gasNodes.gain.gain.setTargetAtTime(on ? 0.14 : 0.0, t, on ? 0.02 : 0.06);
 }
 
+// ---- Deep ground rumble for the colossal's arrival ----
+export function playRumble(dur = 9) {
+  if (!ctx) return;
+  const t = ctx.currentTime;
+  const src = ctx.createBufferSource();
+  src.buffer = noiseBuffer(dur); src.loop = false;
+  const lp = ctx.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 90;
+  const g = ctx.createGain();
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.exponentialRampToValueAtTime(0.5, t + 1.6);
+  g.gain.setValueAtTime(0.5, t + dur - 2);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  src.connect(lp).connect(g).connect(ctx.destination);
+  src.start(t); src.stop(t + dur);
+  const o = ctx.createOscillator(), og = ctx.createGain();
+  o.type = 'sine'; o.frequency.value = 34;
+  og.gain.setValueAtTime(0.0001, t);
+  og.gain.exponentialRampToValueAtTime(0.22, t + 1.8);
+  og.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  o.connect(og).connect(ctx.destination);
+  o.start(t); o.stop(t + dur);
+}
+
+// ---- Lightning strike: sharp crack, then rolling thunder ----
+export function playThunder() {
+  if (!ctx) return;
+  const t = ctx.currentTime;
+  const crack = ctx.createBufferSource(); crack.buffer = noiseBuffer(0.12);
+  const hp = ctx.createBiquadFilter(); hp.type = 'highpass'; hp.frequency.value = 900;
+  const cg = ctx.createGain();
+  cg.gain.setValueAtTime(0.85, t);
+  cg.gain.exponentialRampToValueAtTime(0.0001, t + 0.14);
+  crack.connect(hp).connect(cg).connect(ctx.destination);
+  crack.start(t); crack.stop(t + 0.14);
+  const roll = ctx.createBufferSource(); roll.buffer = noiseBuffer(2.6);
+  const lp = ctx.createBiquadFilter(); lp.type = 'lowpass';
+  lp.frequency.setValueAtTime(900, t);
+  lp.frequency.exponentialRampToValueAtTime(90, t + 2.4);
+  const rg = ctx.createGain();
+  rg.gain.setValueAtTime(0.0001, t);
+  rg.gain.exponentialRampToValueAtTime(0.5, t + 0.08);
+  rg.gain.exponentialRampToValueAtTime(0.0001, t + 2.5);
+  roll.connect(lp).connect(rg).connect(ctx.destination);
+  roll.start(t); roll.stop(t + 2.6);
+}
+
+// ---- The kick: a massive stone-shattering boom ----
+export function playImpact() {
+  if (!ctx) return;
+  const t = ctx.currentTime;
+  const o = ctx.createOscillator(), g = ctx.createGain();
+  o.type = 'sine';
+  o.frequency.setValueAtTime(70, t);
+  o.frequency.exponentialRampToValueAtTime(22, t + 0.7);
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.exponentialRampToValueAtTime(0.9, t + 0.02);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + 1.0);
+  o.connect(g).connect(ctx.destination);
+  o.start(t); o.stop(t + 1.05);
+  const crash = ctx.createBufferSource(); crash.buffer = noiseBuffer(0.9);
+  const bp = ctx.createBiquadFilter(); bp.type = 'lowpass';
+  bp.frequency.setValueAtTime(2600, t);
+  bp.frequency.exponentialRampToValueAtTime(200, t + 0.8);
+  const cg = ctx.createGain();
+  cg.gain.setValueAtTime(0.55, t);
+  cg.gain.exponentialRampToValueAtTime(0.0001, t + 0.9);
+  crash.connect(bp).connect(cg).connect(ctx.destination);
+  crash.start(t); crash.stop(t + 0.9);
+}
+
 // ---- Blade slice: metallic shing + a downward swish + a wet chunk ----
 export function playSlashHit() {
   if (!ctx) return;

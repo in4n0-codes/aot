@@ -206,7 +206,9 @@ export function buildWorld(scene) {
   const rand = mulberry32(20250708);
   const colliders = [];
   const anchorMeshes = [];
-  const roofs = []; // pitched roof surfaces the player can stand/walk on
+  const roofs = [];     // pitched roof surfaces the player can stand/walk on
+  const buildings = []; // building box meshes (wreckable)
+  const chimsRef = {};  // instanced chimneys; filled once they're built
 
   // Overcast-blue sky, distance fog like the show's establishing shots.
   scene.background = new THREE.Color(0x9db6ca);
@@ -280,12 +282,17 @@ export function buildWorld(scene) {
     const ridgeY = eaveY + ridgeH;
     const rd = ridgeAlongX ? new V(1, 0, 0) : new V(0, 0, 1); // ridge direction
     const ac = ridgeAlongX ? new V(0, 0, 1) : new V(1, 0, 0); // across direction
-    const base = new V(cx, 0, cz);
+    // Vertices are built LOCAL to the building (pivot at cx/eaveY/cz, eave at
+    // y=0, ridge at y=ridgeH) and the mesh's own .position carries the world
+    // offset. This keeps rotation/position edits (e.g. wreck damage) sane —
+    // baking absolute world coords into the vertices instead made any later
+    // rotation swing the roof around the world origin, flinging it into the sky.
+    const base = new V(0, 0, 0);
     const corner = (sr, sa, y) => base.clone()
       .addScaledVector(rd, sr * hw).addScaledVector(ac, sa * hac).setY(y);
-    const R0 = corner(-1, 0, ridgeY), R1 = corner(1, 0, ridgeY);
-    const A0 = corner(-1, -1, eaveY), A1 = corner(1, -1, eaveY);
-    const B0 = corner(-1, 1, eaveY), B1 = corner(1, 1, eaveY);
+    const R0 = corner(-1, 0, ridgeH), R1 = corner(1, 0, ridgeH);
+    const A0 = corner(-1, -1, 0), A1 = corner(1, -1, 0);
+    const B0 = corner(-1, 1, 0), B1 = corner(1, 1, 0);
 
     const slant = Math.hypot(hac, ridgeH);
     const uMax = (2 * hw) / 3, vMax = slant / 3;
@@ -301,6 +308,7 @@ export function buildWorld(scene) {
     roofGeo.setAttribute('uv', new THREE.Float32BufferAttribute(ruv, 2));
     roofGeo.computeVertexNormals();
     const roofMesh = new THREE.Mesh(roofGeo, roofFaceMat);
+    roofMesh.position.set(cx, eaveY, cz);
     roofMesh.castShadow = true;
     roofMesh.receiveShadow = true;
     roofMesh.userData.hookable = true;
@@ -320,12 +328,14 @@ export function buildWorld(scene) {
     gableGeo.setAttribute('uv', new THREE.Float32BufferAttribute(guv, 2));
     gableGeo.computeVertexNormals();
     const gableMesh = new THREE.Mesh(gableGeo, gableMats[style]);
+    gableMesh.position.set(cx, eaveY, cz);
     gableMesh.castShadow = true;
     gableMesh.receiveShadow = true;
     scene.add(gableMesh);
 
-    roofs.push({ cx, cz, hw: hwWall, hac: hacWall, eaveY, ridgeH, ridgeAlongX });
-    return ridgeY;
+    const record = { cx, cz, hw: hwWall, hac: hacWall, eaveY, ridgeH, ridgeAlongX };
+    roofs.push(record);
+    return { ridgeY, roofMesh, gableMesh, record };
   }
 
   // District layout: 26u grid with wider lanes between houses, height TIERS
@@ -357,12 +367,17 @@ export function buildWorld(scene) {
       scene.add(mesh);
       mesh.updateMatrixWorld();
       anchorMeshes.push(mesh);
-      colliders.push(new THREE.Box3(
+      const bCollider = new THREE.Box3(
         new THREE.Vector3(x - w / 2, 0, z - d / 2),
         new THREE.Vector3(x + w / 2, h, z + d / 2)
-      ));
-      const ridgeY = addGableRoof(x, z, w, d, h, style);
+      );
+      colliders.push(bCollider);
+      const roofBits = addGableRoof(x, z, w, d, h, style);
+      const ridgeY = roofBits.ridgeY;
       mesh.userData.ridgeY = ridgeY;
+      mesh.userData.collider = bCollider;
+      mesh.userData.roofBits = roofBits; // for wrecking
+      buildings.push(mesh);
       // door on the street side facing the plaza-ish
       const side = Math.abs(x) > Math.abs(z) ? (x > 0 ? 3 : 1) : (z > 0 ? 2 : 0);
       const dx = [0, -1, 0, 1][side], dz = [-1, 0, 1, 0][side];
@@ -374,6 +389,7 @@ export function buildWorld(scene) {
       if (rand() < 0.5) {
         // Chimney rises through the roof, near the ridge line.
         const alongRidge = w >= d;
+        mesh.userData.chimneyIdx = chimneySpots.length; // so wrecks can drop it
         chimneySpots.push({
           x: x + (alongRidge ? (rand() - 0.5) * w * 0.55 : 0),
           y: ridgeY - 0.3,
@@ -407,31 +423,235 @@ export function buildWorld(scene) {
   });
   chims.castShadow = true;
   scene.add(chims);
+  chimsRef.inst = chims; // wrecks drop their chimney with the roof
 
-  // Perimeter wall — Wall Maria scale, hookable.
+  // Perimeter wall — Wall Maria scale, hookable. The SOUTH wall (z=+113) is
+  // breakable: the opening cinematic kicks a hole through it.
   const wallTex = wallTexture();
-  const wallDefs = [
-    [0, -113, 232, 7], [0, 113, 232, 7], [-113, 0, 7, 232], [113, 0, 7, 232],
-  ];
-  for (const [x, z, w, d] of wallDefs) {
-    const h = 55;
+  function buildWallSeg(x, z, w, d, h = 55, y0 = 0) {
     const wt = wallTex.clone(); wt.needsUpdate = true;
     wt.repeat.set(Math.max(w, d) / 14, h / 14);
     const mesh = new THREE.Mesh(box, new THREE.MeshLambertMaterial({ map: wt }));
     mesh.scale.set(w, h, d);
-    mesh.position.set(x, h / 2, z);
+    mesh.position.set(x, y0 + h / 2, z);
     mesh.userData.hookable = true;
-    mesh.userData.roofY = h;
+    mesh.userData.roofY = y0 + h;
     mesh.userData.centerX = x;
     mesh.userData.centerZ = z;
     mesh.receiveShadow = true;
     scene.add(mesh);
     mesh.updateMatrixWorld();
     anchorMeshes.push(mesh);
+    const collider = new THREE.Box3(
+      new THREE.Vector3(x - w / 2, y0, z - d / 2),
+      new THREE.Vector3(x + w / 2, y0 + h, z + d / 2)
+    );
+    colliders.push(collider);
+    return { mesh, collider };
+  }
+  for (const [x, z, w, d] of [[0, -113, 232, 7], [-113, 0, 7, 232], [113, 0, 7, 232]]) {
+    buildWallSeg(x, z, w, d);
+  }
+  const southWall = buildWallSeg(0, 113, 232, 7);
+  const worldRef = {}; // filled at return; breakWall closes over everything
+
+  // Solid stone chunk: mesh + a real collider so nobody walks through it.
+  const rubbleMatShared = new THREE.MeshLambertMaterial({ color: 0x8d877c });
+  function addStone(x, y, z, s, solid = true) {
+    const r = new THREE.Mesh(box, rubbleMatShared);
+    r.scale.set(s, s * 0.7, s);
+    r.position.set(x, Math.max(y, s * 0.35), z);
+    r.rotation.set(Math.random() * 0.4, Math.random() * Math.PI, Math.random() * 0.4);
+    r.castShadow = true;
+    scene.add(r);
+    if (solid && s >= 1.1) {
+      colliders.push(new THREE.Box3(
+        new THREE.Vector3(x - s / 2, 0, z - s / 2),
+        new THREE.Vector3(x + s / 2, r.position.y + s * 0.35, z + s / 2)
+      ));
+    }
+    return r;
+  }
+
+  // Kick a HOLE through the south wall — not a missing wall. Two flanking
+  // segments plus a heavy lintel spanning the top of the gap, so the breach
+  // reads as a ragged archway (~24 wide × 26 high).
+  function breakWall(odm) {
+    if (worldRef.hole && worldRef.hole.open) return;
+    scene.remove(southWall.mesh);
+    const ai = anchorMeshes.indexOf(southWall.mesh);
+    if (ai !== -1) anchorMeshes.splice(ai, 1);
+    if (odm) odm.removeTarget(southWall.mesh);
+    const ci = colliders.indexOf(southWall.collider);
+    if (ci !== -1) colliders.splice(ci, 1);
+    const gapHalf = 12, holeH = 26, h = 55;
+    const segW = (232 - gapHalf * 2) / 2;
+    for (const sx of [-1, 1]) {
+      const seg = buildWallSeg(sx * (gapHalf + segW / 2), 113, segW, 7);
+      if (odm) odm.addTarget(seg.mesh);
+    }
+    // Lintel: the wall above the hole survives.
+    const lw = gapHalf * 2 + 2;
+    const wt = wallTex.clone(); wt.needsUpdate = true;
+    wt.repeat.set(lw / 14, (h - holeH) / 14);
+    const lintel = new THREE.Mesh(box, new THREE.MeshLambertMaterial({ map: wt }));
+    lintel.scale.set(lw, h - holeH, 7);
+    lintel.position.set(0, holeH + (h - holeH) / 2, 113);
+    lintel.userData.hookable = true;
+    lintel.userData.roofY = h;
+    lintel.userData.centerX = 0;
+    lintel.userData.centerZ = 113;
+    lintel.castShadow = true;
+    scene.add(lintel);
+    lintel.updateMatrixWorld();
+    anchorMeshes.push(lintel);
     colliders.push(new THREE.Box3(
-      new THREE.Vector3(x - w / 2, 0, z - d / 2),
-      new THREE.Vector3(x + w / 2, h, z + d / 2)
+      new THREE.Vector3(-lw / 2, holeH, 113 - 3.5),
+      new THREE.Vector3(lw / 2, h, 113 + 3.5)
     ));
+    if (odm) odm.addTarget(lintel);
+    // Ragged jamb shards at the hole's edges.
+    for (const sx of [-1, 1]) {
+      for (let i = 0; i < 3; i++) {
+        const s = 1.5 + Math.random() * 2;
+        const shard = new THREE.Mesh(box, rubbleMatShared);
+        shard.scale.set(s * 0.7, 3 + Math.random() * 7, s * 0.7);
+        shard.position.set(sx * (gapHalf - 0.5), 2 + i * 7 + Math.random() * 3, 113 + (Math.random() - 0.5) * 3);
+        shard.rotation.z = sx * (0.1 + Math.random() * 0.25);
+        scene.add(shard);
+      }
+    }
+    // Rubble heaped at the breach — SOLID stones.
+    for (let i = 0; i < 9; i++) {
+      addStone((Math.random() - 0.5) * 22, 0, 104 + Math.random() * 9, 1 + Math.random() * 2.6);
+    }
+    worldRef.hole.open = true;
+  }
+
+  // A stone strike wrecks a house — each one differently. Three ruin styles:
+  //  'slump'  — roof gone, walls collapsed low and tilted
+  //  'shear'  — one whole side torn away, the rest standing tall and cracked
+  //  'gutted' — roof half-collapsed into the shell, jagged shard skyline
+  function dropChimney(mesh) {
+    const idx = mesh.userData.chimneyIdx;
+    if (idx === undefined || !chimsRef.inst) return;
+    const zero = new THREE.Matrix4().makeScale(0.0001, 0.0001, 0.0001);
+    chimsRef.inst.setMatrixAt(idx, zero);
+    chimsRef.inst.instanceMatrix.needsUpdate = true;
+  }
+  function shardRing(mesh, topY, n) {
+    // Jagged broken-masonry shards along the ruin's skyline.
+    const w = mesh.scale.x, d = mesh.scale.z;
+    for (let i = 0; i < n; i++) {
+      const shard = new THREE.Mesh(box, rubbleMatShared);
+      const sw = 0.8 + Math.random() * 1.6;
+      shard.scale.set(sw, 1.5 + Math.random() * 3.5, sw);
+      const edge = Math.random() < 0.5;
+      shard.position.set(
+        mesh.position.x + (edge ? (Math.random() - 0.5) * w : (Math.random() < 0.5 ? -1 : 1) * w * 0.45),
+        topY + shard.scale.y * 0.2,
+        mesh.position.z + (edge ? (Math.random() < 0.5 ? -1 : 1) * d * 0.45 : (Math.random() - 0.5) * d)
+      );
+      shard.rotation.set((Math.random() - 0.5) * 0.5, Math.random() * Math.PI, (Math.random() - 0.5) * 0.5);
+      shard.castShadow = true;
+      scene.add(shard);
+    }
+  }
+  function wreckBuilding(mesh, odm) {
+    if (!mesh || mesh.userData.wrecked) return;
+    mesh.userData.wrecked = true;
+    const bits = mesh.userData.roofBits;
+    const style = ['slump', 'shear', 'gutted'][(Math.random() * 3) | 0];
+    const c = mesh.userData.collider;
+    const origH = mesh.scale.y;
+    // Decide the new wall height up front so the roof (if it's kept for the
+    // 'gutted' look) can settle onto it by a RELATIVE amount, not an absolute
+    // position overwrite — the roof mesh's position is its real world anchor
+    // now (see addGableRoof), so rotating/moving it stays local to the house.
+    const newHFor = {
+      slump: origH * (0.4 + Math.random() * 0.2),
+      shear: origH * (0.8 + Math.random() * 0.15),
+      gutted: origH * (0.62 + Math.random() * 0.12),
+    };
+    const newH = newHFor[style];
+
+    // The roof is torn off (or caves in) in every style.
+    if (bits) {
+      const ri = roofs.indexOf(bits.record);
+      if (ri !== -1) roofs.splice(ri, 1); // never a phantom surface
+      const ai = anchorMeshes.indexOf(bits.roofMesh);
+      if (ai !== -1) anchorMeshes.splice(ai, 1);
+      if (odm) odm.removeTarget(bits.roofMesh);
+      if (style === 'gutted') {
+        // Half the roof stays, sunk down onto the shorter walls and caved in
+        // at an angle — tilts/rotates about the roof's own base now, so it
+        // settles onto the house instead of flinging off into the sky.
+        bits.gableMesh && scene.remove(bits.gableMesh);
+        bits.roofMesh.position.y -= (origH - newH);
+        bits.roofMesh.rotation.x = (Math.random() - 0.5) * 0.25;
+        bits.roofMesh.rotation.z = 0.35 + Math.random() * 0.25;
+        bits.roofMesh.scale.set(0.55, 1, 0.9);
+      } else {
+        scene.remove(bits.roofMesh);
+        scene.remove(bits.gableMesh);
+      }
+    }
+    dropChimney(mesh);
+
+    if (style === 'slump') {
+      mesh.scale.y = newH;
+      mesh.position.y = newH / 2;
+      mesh.rotation.z = (Math.random() - 0.5) * 0.3;
+      mesh.rotation.x = (Math.random() - 0.5) * 0.18;
+      mesh.userData.roofY = newH;
+      mesh.userData.ridgeY = newH;
+      if (c) c.max.y = newH;
+      shardRing(mesh, newH, 5);
+    } else if (style === 'shear') {
+      // Tear one whole side away: the box narrows and shifts so a flank is gone.
+      const axis = Math.random() < 0.5 ? 'x' : 'z';
+      const side = Math.random() < 0.5 ? -1 : 1;
+      const keep = 0.55 + Math.random() * 0.15;
+      const old = mesh.scale[axis];
+      mesh.scale[axis] = old * keep;
+      mesh.position[axis] += side * old * (1 - keep) * 0.5;
+      mesh.scale.y = newH;
+      mesh.position.y = newH / 2;
+      mesh.rotation.z = (Math.random() - 0.5) * 0.1;
+      mesh.userData.roofY = newH;
+      mesh.userData.ridgeY = newH;
+      if (c) {
+        c.max.y = newH;
+        const half = mesh.scale[axis] / 2;
+        c.min[axis === 'x' ? 'x' : 'z'] = mesh.position[axis] - half;
+        c.max[axis === 'x' ? 'x' : 'z'] = mesh.position[axis] + half;
+      }
+      // Debris where the torn side used to stand.
+      const spillAt = mesh.position[axis] - side * (mesh.scale[axis] / 2 + 2);
+      for (let i = 0; i < 5; i++) {
+        const px = axis === 'x' ? spillAt + (Math.random() - 0.5) * 4 : mesh.position.x + (Math.random() - 0.5) * mesh.scale.x;
+        const pz = axis === 'z' ? spillAt + (Math.random() - 0.5) * 4 : mesh.position.z + (Math.random() - 0.5) * mesh.scale.z;
+        addStone(px, 0, pz, 1 + Math.random() * 2.2);
+      }
+      shardRing(mesh, newH, 4);
+    } else { // gutted
+      mesh.scale.y = newH;
+      mesh.position.y = newH / 2;
+      mesh.rotation.x = (Math.random() - 0.5) * 0.08;
+      mesh.userData.roofY = newH;
+      mesh.userData.ridgeY = newH;
+      if (c) c.max.y = newH;
+      shardRing(mesh, newH, 6);
+    }
+    // Rubble spilling into the street — SOLID stones you can't walk through.
+    for (let i = 0; i < 6; i++) {
+      addStone(
+        mesh.position.x + (Math.random() - 0.5) * (mesh.scale.x + 9),
+        0,
+        mesh.position.z + (Math.random() - 0.5) * (mesh.scale.z + 9),
+        0.9 + Math.random() * 2.2
+      );
+    }
   }
 
   // Grass tufts (instanced) sprinkled along streets, plaza edge, wall base.
@@ -531,11 +751,18 @@ export function buildWorld(scene) {
   glow.position.set(supplyPos.x, 4, supplyPos.z);
   scene.add(glow);
 
-  return {
+  const world = {
     colliders,
     roofs,
+    buildings,
     anchorMeshes,
     clouds,
     supply: { pos: supplyPos, radius: 5, beacon, ring },
+    hole: { x: 0, z: 108, halfWidth: 12, open: false },
+    breakWall,
+    wreckBuilding,
+    addStone,
   };
+  worldRef.hole = world.hole;
+  return world;
 }
