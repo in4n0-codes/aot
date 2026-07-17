@@ -55,12 +55,28 @@
     #counts .civs { color: #a9d6a0; }
     #counts .saved { color: #e8c14b; }
     #rescue {
-      position: absolute; left: 50%; top: 24%; transform: translateX(-50%);
+      position: absolute; left: 50%; top: 22%; transform: translateX(-50%);
       text-align: center; display: none;
     }
-    #rescue .msg { font-size: 15px; letter-spacing: 2px; color: #ff9a6a; text-shadow: 0 2px 5px #000; }
-    #rescue .arrow { font-size: 40px; color: #ff7a45; text-shadow: 0 2px 6px #000; line-height: 1; }
-    #rescue .timer { font-size: 20px; color: #e8e4da; text-shadow: 0 1px 4px #000; }
+    #rescue .msg {
+      font-size: 15px; letter-spacing: 2px; color: #ff9a6a; text-shadow: 0 2px 5px #000;
+      margin-bottom: 4px;
+    }
+    #rescueArrow {
+      width: 54px; height: 54px; color: #ff7a45;
+      filter: drop-shadow(0 2px 5px rgba(0,0,0,0.7));
+      transform-origin: 50% 50%;
+      transition: transform 0.12s linear;
+    }
+    #rescue .readout {
+      display: flex; align-items: baseline; justify-content: center; gap: 10px;
+      margin-top: 2px;
+    }
+    #rescue .dist { font-size: 22px; font-weight: 600; color: #e8e4da; text-shadow: 0 1px 4px #000; }
+    #rescue .timer {
+      font-size: 20px; color: #ffcf4a; text-shadow: 0 1px 4px #000;
+      min-width: 34px;
+    }
     #flash {
       position: absolute; inset: 0; background: #fff; opacity: 0;
       pointer-events: none; z-index: 8;
@@ -86,6 +102,11 @@
     #speed {
       position: absolute; right: 24px; bottom: 24px; font-size: 13px; letter-spacing: 1px;
       color: rgba(232,228,218,0.75); text-shadow: 0 1px 2px #000;
+    }
+    #perf {
+      position: absolute; left: 24px; top: 18px; font-size: 12px; line-height: 1.5;
+      color: rgba(160,255,160,0.85); text-shadow: 0 1px 3px #000;
+      font-family: Consolas, monospace; display: none; white-space: pre;
     }
     #overlay {
       position: absolute; inset: 0; display: flex; flex-direction: column;
@@ -126,8 +147,13 @@
     </div>
     <div id="rescue">
       <div class="msg" id="rescueMsg"></div>
-      <div class="arrow" id="rescueArrow">▲</div>
-      <div class="timer" id="rescueTimer"></div>
+      <svg id="rescueArrow" viewBox="0 0 64 64" fill="currentColor">
+        <path d="M32 2 L54 42 L38 42 L38 62 L26 62 L26 42 L10 42 Z" />
+      </svg>
+      <div class="readout">
+        <span class="dist" id="rescueDist"></span>
+        <span class="timer" id="rescueTimer"></span>
+      </div>
     </div>
     <div id="flash"></div>
     <div id="cine-top"></div>
@@ -135,6 +161,7 @@
     <div id="subtitle"></div>
     <div id="cine-skip">ENTER TO SKIP</div>
     <div id="speed"></div>
+    <div id="perf"></div>
     <div id="toast"></div>
     <div id="overlay">
       <h1>ODM GEAR</h1>

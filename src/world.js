@@ -218,12 +218,27 @@ export function buildWorld(scene) {
   const sun = new THREE.DirectionalLight(0xf3e8cf, 2.0);
   sun.position.set(90, 150, 55);
   sun.castShadow = true;
+  // The shadow frustum TRACKS THE PLAYER (see updateSunShadow) instead of
+  // spanning the whole 280-unit district. Two big wins: three can frustum-cull
+  // far-away casters out of the shadow pass entirely (it was re-rendering every
+  // building and every titan limb each frame), and the same 2048 map now covers
+  // ~85 units instead of 280 — roughly 3x sharper shadows for less work.
+  const SHADOW_EXTENT = 85;
   sun.shadow.mapSize.set(2048, 2048);
-  sun.shadow.camera.left = -140; sun.shadow.camera.right = 140;
-  sun.shadow.camera.top = 140; sun.shadow.camera.bottom = -140;
+  sun.shadow.camera.left = -SHADOW_EXTENT; sun.shadow.camera.right = SHADOW_EXTENT;
+  sun.shadow.camera.top = SHADOW_EXTENT; sun.shadow.camera.bottom = -SHADOW_EXTENT;
   sun.shadow.camera.near = 20; sun.shadow.camera.far = 420;
   sun.shadow.bias = -0.0006;
-  scene.add(hemi, sun);
+  scene.add(hemi, sun, sun.target);
+
+  // Slide the sun + its target so the lit region stays centred on the player,
+  // keeping the light DIRECTION identical (offset is constant).
+  const SUN_OFFSET = new THREE.Vector3(90, 150, 55);
+  function updateSunShadow(px, pz) {
+    sun.position.set(px + SUN_OFFSET.x, SUN_OFFSET.y, pz + SUN_OFFSET.z);
+    sun.target.position.set(px, 0, pz);
+    sun.target.updateMatrixWorld();
+  }
 
   // Cobbled ground
   const cobble = cobbleTexture();
@@ -455,22 +470,40 @@ export function buildWorld(scene) {
   const southWall = buildWallSeg(0, 113, 232, 7);
   const worldRef = {}; // filled at return; breakWall closes over everything
 
-  // Solid stone chunk: mesh + a real collider so nobody walks through it.
+  // ---- Instanced rubble pool ----
+  // A breach + wrecked houses scatter 150+ stones and shards. As individual
+  // meshes that's 150+ draw calls (doubled in the shadow pass) for identical
+  // boxes; pooling them into ONE InstancedMesh makes it a single call.
   const rubbleMatShared = new THREE.MeshLambertMaterial({ color: 0x8d877c });
+  const RUBBLE_MAX = 400;
+  const rubbleMesh = new THREE.InstancedMesh(box, rubbleMatShared, RUBBLE_MAX);
+  rubbleMesh.castShadow = true;
+  rubbleMesh.receiveShadow = true;
+  rubbleMesh.count = 0;
+  rubbleMesh.frustumCulled = false; // spread across the whole district
+  scene.add(rubbleMesh);
+  const _rm = new THREE.Matrix4(), _rq = new THREE.Quaternion();
+  const _rp = new THREE.Vector3(), _rsc = new THREE.Vector3(), _rot = new THREE.Euler();
+  function addRubble(px, py, pz, sx, sy, sz, rx, ry, rz) {
+    if (rubbleMesh.count >= RUBBLE_MAX) return;
+    const i = rubbleMesh.count++;
+    _rq.setFromEuler(_rot.set(rx, ry, rz));
+    _rm.compose(_rp.set(px, py, pz), _rq, _rsc.set(sx, sy, sz));
+    rubbleMesh.setMatrixAt(i, _rm);
+    rubbleMesh.instanceMatrix.needsUpdate = true;
+  }
+
+  // Solid stone chunk: instanced visual + a real collider so nobody walks through.
   function addStone(x, y, z, s, solid = true) {
-    const r = new THREE.Mesh(box, rubbleMatShared);
-    r.scale.set(s, s * 0.7, s);
-    r.position.set(x, Math.max(y, s * 0.35), z);
-    r.rotation.set(Math.random() * 0.4, Math.random() * Math.PI, Math.random() * 0.4);
-    r.castShadow = true;
-    scene.add(r);
+    const py = Math.max(y, s * 0.35);
+    addRubble(x, py, z, s, s * 0.7, s,
+      Math.random() * 0.4, Math.random() * Math.PI, Math.random() * 0.4);
     if (solid && s >= 1.1) {
       colliders.push(new THREE.Box3(
         new THREE.Vector3(x - s / 2, 0, z - s / 2),
-        new THREE.Vector3(x + s / 2, r.position.y + s * 0.35, z + s / 2)
+        new THREE.Vector3(x + s / 2, py + s * 0.35, z + s / 2)
       ));
     }
-    return r;
   }
 
   // Kick a HOLE through the south wall — not a missing wall. Two flanking
@@ -514,11 +547,11 @@ export function buildWorld(scene) {
     for (const sx of [-1, 1]) {
       for (let i = 0; i < 3; i++) {
         const s = 1.5 + Math.random() * 2;
-        const shard = new THREE.Mesh(box, rubbleMatShared);
-        shard.scale.set(s * 0.7, 3 + Math.random() * 7, s * 0.7);
-        shard.position.set(sx * (gapHalf - 0.5), 2 + i * 7 + Math.random() * 3, 113 + (Math.random() - 0.5) * 3);
-        shard.rotation.z = sx * (0.1 + Math.random() * 0.25);
-        scene.add(shard);
+        addRubble(
+          sx * (gapHalf - 0.5), 2 + i * 7 + Math.random() * 3, 113 + (Math.random() - 0.5) * 3,
+          s * 0.7, 3 + Math.random() * 7, s * 0.7,
+          0, 0, sx * (0.1 + Math.random() * 0.25)
+        );
       }
     }
     // Rubble heaped at the breach — SOLID stones.
@@ -543,18 +576,16 @@ export function buildWorld(scene) {
     // Jagged broken-masonry shards along the ruin's skyline.
     const w = mesh.scale.x, d = mesh.scale.z;
     for (let i = 0; i < n; i++) {
-      const shard = new THREE.Mesh(box, rubbleMatShared);
       const sw = 0.8 + Math.random() * 1.6;
-      shard.scale.set(sw, 1.5 + Math.random() * 3.5, sw);
+      const sh = 1.5 + Math.random() * 3.5;
       const edge = Math.random() < 0.5;
-      shard.position.set(
+      addRubble(
         mesh.position.x + (edge ? (Math.random() - 0.5) * w : (Math.random() < 0.5 ? -1 : 1) * w * 0.45),
-        topY + shard.scale.y * 0.2,
-        mesh.position.z + (edge ? (Math.random() < 0.5 ? -1 : 1) * d * 0.45 : (Math.random() - 0.5) * d)
+        topY + sh * 0.2,
+        mesh.position.z + (edge ? (Math.random() < 0.5 ? -1 : 1) * d * 0.45 : (Math.random() - 0.5) * d),
+        sw, sh, sw,
+        (Math.random() - 0.5) * 0.5, Math.random() * Math.PI, (Math.random() - 0.5) * 0.5
       );
-      shard.rotation.set((Math.random() - 0.5) * 0.5, Math.random() * Math.PI, (Math.random() - 0.5) * 0.5);
-      shard.castShadow = true;
-      scene.add(shard);
     }
   }
   function wreckBuilding(mesh, odm) {
@@ -762,6 +793,7 @@ export function buildWorld(scene) {
     breakWall,
     wreckBuilding,
     addStone,
+    updateSunShadow,
   };
   worldRef.hole = world.hole;
   return world;

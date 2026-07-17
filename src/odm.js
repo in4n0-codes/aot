@@ -21,6 +21,8 @@ export const OTUNE = {
   vaultEdgeBand: 4,   // anchor counts as "roof edge" within this of the top
 };
 
+const SLASH_DUR = 0.24; // seconds the blade sweep takes
+
 const _a = new THREE.Vector3();
 const _out = new THREE.Vector3();
 const _dir = new THREE.Vector3();
@@ -28,6 +30,54 @@ const _up = new THREE.Vector3();
 const _hand = new THREE.Vector3();
 const _right = new THREE.Vector3();
 const _proj = new THREE.Vector3();
+
+// One ODM blade held in first person: dark grip + housing, and a long tapered
+// steel blade. depthTest:false keeps it drawing over the world like a proper
+// FPS viewmodel. `side` is -1 (left hand) or +1 (right hand).
+function makeBlade(side) {
+  const g = new THREE.Group();
+  const steel = new THREE.MeshPhongMaterial({
+    color: 0xdbe3ea, specular: 0xffffff, shininess: 95,
+    depthTest: false, transparent: true, opacity: 1,
+  });
+  const dark = new THREE.MeshPhongMaterial({
+    color: 0x2c3238, specular: 0x5a6068, shininess: 30,
+    depthTest: false, transparent: true, opacity: 1,
+  });
+
+  const grip = new THREE.Mesh(new THREE.BoxGeometry(0.032, 0.042, 0.2), dark);
+  grip.position.set(0, 0, 0.08);
+  g.add(grip);
+
+  const housing = new THREE.Mesh(new THREE.BoxGeometry(0.046, 0.058, 0.11), dark);
+  housing.position.set(0, 0, -0.04);
+  g.add(housing);
+
+  // Blade extends forward (-Z) from the housing, tapering to a point.
+  const len = 0.82;
+  const bladeGeo = new THREE.BoxGeometry(0.011, 0.06, len);
+  bladeGeo.translate(0, 0, -(len / 2) - 0.08);
+  const pos = bladeGeo.attributes.position;
+  for (let i = 0; i < pos.count; i++) {
+    // 0 at the housing end, 1 at the tip — squeeze the height toward the tip.
+    const t = Math.max(0, Math.min(1, (-pos.getZ(i) - 0.08) / len));
+    const taper = 1 - 0.8 * Math.max(0, (t - 0.55) / 0.45);
+    pos.setY(i, pos.getY(i) * taper);
+  }
+  bladeGeo.computeVertexNormals();
+  const blade = new THREE.Mesh(bladeGeo, steel);
+  g.add(blade);
+
+  g.userData.mats = [steel, dark];
+  g.userData.rest = {
+    pos: new THREE.Vector3(side * 0.30, -0.27, -0.44),
+    rot: new THREE.Euler(0.10, side * -0.28, side * -0.16),
+  };
+  g.position.copy(g.userData.rest.pos);
+  g.rotation.copy(g.userData.rest.rot);
+  g.renderOrder = 9;
+  return g;
+}
 
 class Hook {
   constructor(scene, side) {
@@ -85,6 +135,13 @@ export class ODM {
     this.slashMesh.position.set(0.25, -0.1, -1.3);
     this.slashMesh.renderOrder = 10;
     camera.add(this.slashMesh);
+
+    // The two ODM blades, held in view. They live on the camera so they always
+    // render in front of the world (depthTest off + high renderOrder), and
+    // sweep across on a slash.
+    this.bladeL = makeBlade(-1);
+    this.bladeR = makeBlade(1);
+    camera.add(this.bladeL, this.bladeR);
   }
 
   addTarget(mesh) {
@@ -203,7 +260,9 @@ export class ODM {
     if (this.player.blades <= 0 || this.time < this.slashCooldown) return;
     this.slashCooldown = this.time + 0.35;
     this.player.blades -= 1;
-    this.slashUntil = this.time + 0.15;
+    this.slashUntil = this.time + SLASH_DUR;
+    // Alternate which blade leads, so repeated slashes don't look identical.
+    this.slashLead = this.slashLead === 1 ? -1 : 1;
     if (this.onSlash) this.onSlash();
     if (this.player.blades <= 0) this.hud.toast('BLADES SPENT — RESUPPLY', 2200);
   }
@@ -346,14 +405,47 @@ export class ODM {
     }
     if (!reticleOn) this.hud.setReticle(false);
 
-    // Blade swipe animation.
+    // Blade swipe streak.
     const mat = this.slashMesh.material;
-    if (this.time < this.slashUntil) {
-      const t = 1 - (this.slashUntil - this.time) / 0.15;
+    const slashing = this.time < this.slashUntil;
+    if (slashing) {
+      const t = 1 - (this.slashUntil - this.time) / SLASH_DUR;
       mat.opacity = 0.85 * (1 - t);
       this.slashMesh.rotation.z = 0.9 - 1.8 * t;
     } else {
       mat.opacity = 0;
+    }
+    this.animateBlades(dt, slashing);
+  }
+
+  // Blades rest at the hips and scissor across the view on a slash.
+  animateBlades(dt, slashing) {
+    // s: 0 → 1 across the swing. sin() sweeps out and back in one motion.
+    const s = slashing ? 1 - (this.slashUntil - this.time) / SLASH_DUR : 0;
+    const swing = slashing ? Math.sin(Math.max(0, Math.min(1, s)) * Math.PI) : 0;
+    const spent = this.player.blades <= 0;
+    const lead = this.slashLead || 1;
+
+    for (const [b, side] of [[this.bladeL, -1], [this.bladeR, 1]]) {
+      // The leading blade travels further, so the pair reads as a scissor cut.
+      const amt = swing * (side === lead ? 1 : 0.55);
+      const rest = b.userData.rest;
+      b.position.set(
+        rest.pos.x - side * 0.62 * amt,
+        rest.pos.y + 0.20 * amt,
+        rest.pos.z - 0.34 * amt
+      );
+      b.rotation.set(
+        rest.rot.x + 0.35 * amt,
+        rest.rot.y + side * 0.85 * amt,
+        rest.rot.z + side * 1.7 * amt
+      );
+      // Fade out when the blades are spent; they come back on resupply.
+      const targetOpacity = spent ? 0 : 1;
+      for (const m of b.userData.mats) {
+        m.opacity += (targetOpacity - m.opacity) * Math.min(1, dt * 8);
+      }
+      b.visible = b.userData.mats[0].opacity > 0.02;
     }
   }
 }

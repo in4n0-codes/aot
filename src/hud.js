@@ -21,6 +21,7 @@ export class HUD {
     this.rescueEl = document.getElementById('rescue');
     this.rescueMsg = document.getElementById('rescueMsg');
     this.rescueArrow = document.getElementById('rescueArrow');
+    this.rescueDist = document.getElementById('rescueDist');
     this.rescueTimer = document.getElementById('rescueTimer');
     this.mapRange = 118; // world units from centre shown to the map edge
   }
@@ -90,7 +91,9 @@ export class HUD {
     ctx.restore();
   }
 
-  // On-screen compass toward a victim to be rescued, with the countdown.
+  // On-screen compass toward a victim to be rescued: an arrow that points the
+  // right way (rotates relative to where the player is facing), plus the
+  // straight-line distance and the countdown to the chomp.
   setRescue(active, worldPos, player, secsLeft, isScout) {
     if (!this.rescueEl) return;
     if (!active) { this.rescueEl.style.display = 'none'; return; }
@@ -98,6 +101,8 @@ export class HUD {
     this.rescueMsg.textContent = (isScout ? 'A SCOUT' : 'A CIVILIAN') + ' IS BEING EATEN — SAVE THEM';
     this.rescueTimer.textContent = Math.ceil(secsLeft) + 's';
     const dx = worldPos.x - player.pos.x, dz = worldPos.z - player.pos.z;
+    const dist = Math.hypot(dx, dz);
+    this.rescueDist.textContent = Math.round(dist) + 'm';
     const bearing = Math.atan2(dx, dz) - player.yaw; // relative to facing
     this.rescueArrow.style.transform = `rotate(${bearing}rad)`;
   }

@@ -172,7 +172,33 @@ document.addEventListener('keydown', (e) => {
   if (e.code === 'Enter' && state === 'cinematic') cine.skip();
   if (e.code === 'KeyM') toggleMusic();
   if (e.code === 'KeyN') nextTrack();
+  if (e.code === 'KeyF') { // F = perf overlay (real FPS + draw calls)
+    perfOn = !perfOn;
+    perfEl.style.display = perfOn ? 'block' : 'none';
+  }
 });
+
+// ---- Perf overlay (press F) -------------------------------------------------
+// FPS and draw calls are what actually matter here — VRAM usage is not a
+// measure of whether the GPU is working.
+const perfEl = document.getElementById('perf');
+let perfOn = false;
+let perfAccum = 0, perfFrames = 0, perfWorst = 0;
+function updatePerf(realDt) {
+  if (!perfOn) return;
+  perfAccum += realDt; perfFrames++;
+  perfWorst = Math.max(perfWorst, realDt);
+  if (perfAccum >= 0.5) {
+    const fps = perfFrames / perfAccum;
+    const info = renderer.info;
+    perfEl.textContent =
+      `FPS   ${fps.toFixed(0)}  (worst frame ${(perfWorst * 1000).toFixed(1)}ms)\n` +
+      `calls ${info.render.calls}   tris ${(info.render.triangles / 1000).toFixed(0)}k\n` +
+      `geom  ${info.memory.geometries}  tex ${info.memory.textures}\n` +
+      `titans ${titans.titans.filter((t) => t.alive).length}`;
+    perfAccum = 0; perfFrames = 0; perfWorst = 0;
+  }
+}
 
 // Rating blends mid-bite rescues (the headline stat) with how many scouts and
 // civilians survived overall.
@@ -290,6 +316,10 @@ function frame() {
     }
   }
 
+  // Keep the sun's shadow frustum centred on the player: sharper shadows, and
+  // distant casters get culled out of the shadow pass entirely.
+  world.updateSunShadow(player.pos.x, player.pos.z);
+
   world.supply.ring.scale.setScalar(1 + 0.08 * Math.sin(elapsed * 2.5));
   for (const c of world.clouds) {
     c.position.x += dt * 1.2;
@@ -330,6 +360,7 @@ function frame() {
   }
 
   renderer.render(scene, camera);
+  updatePerf(realDt);
   requestAnimationFrame(frame);
 }
 frame();

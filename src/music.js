@@ -9,16 +9,30 @@ let started = false;
 let muted = false;
 let vol = 0.45;
 
+function shuffle(arr) {
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = (Math.random() * (i + 1)) | 0;
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
+}
+
 export async function initMusic() {
   if (audioEl) return;
   audioEl = new Audio();
   audioEl.volume = vol;
-  audioEl.addEventListener('ended', () => { idx = (idx + 1) % Math.max(1, list.length); play(); });
+  // Reshuffle every time the playlist wraps, so the loop doesn't repeat the
+  // same order (and the same opening track) run after run.
+  audioEl.addEventListener('ended', () => {
+    idx += 1;
+    if (idx >= list.length) { shuffle(list); idx = 0; }
+    play();
+  });
   try {
     const res = await fetch('music/playlist.json', { cache: 'no-cache' });
     if (res.ok) {
       const data = await res.json();
-      if (Array.isArray(data)) list = data.filter((s) => typeof s === 'string' && s.trim());
+      if (Array.isArray(data)) list = shuffle(data.filter((s) => typeof s === 'string' && s.trim()));
     }
   } catch (e) { list = []; }
 }

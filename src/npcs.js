@@ -72,6 +72,23 @@ class Civilian {
       dz = Math.cos(this.phase * 0.3);
       speed = 0.6;
     }
+    // Don't sprint blindly into a corner and get pinned there. Near the map
+    // edge, bend the escape back toward open ground — otherwise every chase
+    // ends at the same few corners, which made rescues feel like they always
+    // happened in the same spots.
+    if (speed > 1) {
+      const EDGE = 74, span = 100 - EDGE;
+      let bx = 0, bz = 0;
+      if (p.x > EDGE) bx = -(p.x - EDGE) / span;
+      else if (p.x < -EDGE) bx = (-p.x - EDGE) / span;
+      if (p.z > EDGE) bz = -(p.z - EDGE) / span;
+      else if (p.z < -EDGE) bz = (-p.z - EDGE) / span;
+      if (bx || bz) {
+        const w = Math.min(1, Math.hypot(bx, bz)) * 1.6;
+        dx += bx * w; dz += bz * w;
+        const ll = Math.hypot(dx, dz) || 1; dx /= ll; dz /= ll;
+      }
+    }
     const nx = p.x + dx * speed * dt, nz = p.z + dz * speed * dt;
     if (!this.blocked(nx, nz, 0.5, colliders)) { p.x = nx; p.z = nz; }
     else if (!this.blocked(nx, p.z, 0.5, colliders)) p.x = nx;
@@ -100,6 +117,9 @@ class Scout {
     this.state = 'hunt'; // hunt | flee
     this.fleeUntil = 0;
     this.nextDiveAt = 0;
+    this.target = null;
+    this.recklessRolled = false; // has this engagement's reckless-dive coin been flipped?
+    this.reckless = false;       // this engagement: press a dive despite the titan being healthy
     this.vel = new THREE.Vector3();
     this.phase = rand() * 10;
     this.anchor = null;      // real world point the cable is attached to
@@ -201,13 +221,22 @@ class Scout {
       let target = pick(false) || pick(true);
       if (!target) { _goal.copy(this.patrol); this.cable.visible = false; return; }
       if (claimed) claimed.add(target);
+      if (this.target !== target) { this.recklessRolled = false; this.reckless = false; }
       this.target = target;
       const open = target.eating || time < target.staggerUntil;
+      // A veteran mostly waits for an opening — but once in a while (never
+      // against an abnormal) they press a dive on a healthy titan anyway.
+      // That's genuinely risky: without it, a titan never gets a real chance
+      // to catch a scout, since a scout that only ever dives on an already-
+      // distracted titan can never be caught off guard.
+      if (!open && !target.abnormal && !this.recklessRolled) {
+        this.recklessRolled = true;
+        this.reckless = Math.random() < 0.15;
+      }
+      const committing = open || this.reckless;
       target.napeWorld(_goal);
       target.group.getWorldDirection(_v);
-      // A healthy titan can grab: circle it at a SAFE height/distance and wait
-      // for an opening. Only a distracted one gets swooped in on.
-      if (!open) {
+      if (!committing) {
         const orbit = 15 + Math.sin(time * 0.9 + this.phase) * 4;
         const ang = time * 0.7 + this.phase;
         _goal.set(
@@ -219,10 +248,12 @@ class Scout {
         _goal.addScaledVector(_v, -4).y += 1.5; // swoop behind the nape
       }
       const dNape = p.distanceTo(_goal);
-      // Only dive when there's an actual opening (distracted titan) and close.
-      if (open && dNape < 3.5 && time >= this.nextDiveAt) {
+      if (committing && dNape < 3.5 && time >= this.nextDiveAt) {
         this.nextDiveAt = time + 5 + Math.random() * 4;
-        const res = titansMgr.scoutCut(target, this, time);
+        const wasReckless = this.reckless;
+        this.recklessRolled = false;
+        this.reckless = false;
+        const res = titansMgr.scoutCut(target, this, time, wasReckless);
         if (res === 'kill' && hud) hud.toast('A SCOUT TOOK ONE DOWN');
         if (res === 'caught' && hud) hud.toast('A SCOUT IS CAUGHT — SAVE THEM!', 2600);
         this.state = 'flee';

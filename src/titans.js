@@ -180,11 +180,16 @@ class Titan {
     this.group = g;
     g.position.set(x, 0, z);
 
-    const tag = (mesh) => {
+    // `shadow` is opt-in per part: only the big masses (torso, head, limbs)
+    // cast. Every titan has ~20 pieces, and casting from all of them meant
+    // ~240 extra draw calls per frame in the shadow pass across a full field
+    // of titans — for detail (ears, nape, knees) nobody can pick out in a
+    // shadow anyway.
+    const tag = (mesh, shadow = false) => {
       mesh.userData.titanPart = true;
       mesh.userData.titanRoot = g;
       mesh.userData.titan = this;
-      mesh.castShadow = true;
+      mesh.castShadow = shadow;
       this.parts.push(mesh);
       return mesh;
     };
@@ -193,7 +198,7 @@ class Titan {
     for (const side of [-1, 1]) {
       const pivot = new THREE.Group();
       pivot.position.set(side * 0.085, 0.5, 0);
-      const thigh = tag(new THREE.Mesh(new THREE.CapsuleGeometry(0.055, 0.42, 4, 8), skinDark));
+      const thigh = tag(new THREE.Mesh(new THREE.CapsuleGeometry(0.055, 0.42, 4, 8), skinDark), true);
       thigh.position.y = -0.25;
       pivot.add(thigh);
       const knee = tag(new THREE.Mesh(new THREE.SphereGeometry(0.055, 8, 6), skinDark));
@@ -206,7 +211,7 @@ class Titan {
     const hips = tag(new THREE.Mesh(new THREE.BoxGeometry(0.26, 0.14, 0.17), skinDark));
     hips.position.y = 0.53;
     g.add(hips);
-    const torso = tag(new THREE.Mesh(new THREE.CapsuleGeometry(0.16, 0.24, 4, 10), skin));
+    const torso = tag(new THREE.Mesh(new THREE.CapsuleGeometry(0.16, 0.24, 4, 10), skin), true);
     torso.position.set(0, 0.72, -0.01);
     torso.rotation.x = 0.14;
     torso.scale.set(1.15, 1, 0.8);
@@ -223,7 +228,7 @@ class Titan {
       g.add(shoulder);
       const pivot = new THREE.Group();
       pivot.position.set(side * 0.235, 0.85, 0);
-      const arm = tag(new THREE.Mesh(new THREE.CapsuleGeometry(0.045, 0.40, 4, 8), skin));
+      const arm = tag(new THREE.Mesh(new THREE.CapsuleGeometry(0.045, 0.40, 4, 8), skin), true);
       arm.position.y = -0.24;
       pivot.add(arm);
       const hand = tag(new THREE.Mesh(new THREE.SphereGeometry(0.06, 8, 6), skinDark));
@@ -240,7 +245,7 @@ class Titan {
     g.add(neck);
     const faceMat = new THREE.MeshLambertMaterial({ map: faceTexture(rand) });
     const headMats = [skin, skin, skin, skin, faceMat, skin];
-    const head = tag(new THREE.Mesh(new THREE.BoxGeometry(0.21, 0.24, 0.21), headMats));
+    const head = tag(new THREE.Mesh(new THREE.BoxGeometry(0.21, 0.24, 0.21), headMats), true);
     head.position.set(0, 1.03, 0.02);
     head.scale.setScalar(headScale);
     g.add(head);
@@ -283,6 +288,9 @@ class Titan {
   // ---- Grab & eat: reach out, lift the victim to the mouth, chomp ----
   startEat(kind, ref, setPos) {
     if (this.eating || !this.alive) return false;
+    // Rescue missions are never against an abnormal — with its 2-3 nape hits
+    // needed, a 15s window plus travel time there could easily be unfair.
+    if (kind !== 'player' && this.abnormal) return false;
     const T = kind === 'player' ? EAT : EAT_NPC;
     this.eating = { kind, ref, setPos, t: 0, chomped: false, T };
     ref.beingEaten = true;
@@ -417,6 +425,28 @@ class Titan {
 
     this.pickTarget(time, player, npcs, mgr);
 
+    // Opportunistic snatch: ANY civilian or scout that wanders within arm's
+    // reach gets caught — not just this titan's officially assigned target.
+    // That's what lets a grab happen anywhere two paths cross in the
+    // district, instead of only where someone gets cornered by the map.
+    // Abnormals never grab NPCs (enforced in startEat too — rescues should
+    // never involve a multi-hit nape against a tight clock).
+    if (!this.abnormal && npcs && time > this.attackReadyAt) {
+      const reach = TTUNE.grabRange + 0.06 * this.h;
+      const gp = this.group.position;
+      const tryGrab = (kind, ref) => {
+        if (!ref.alive || ref.beingEaten) return false;
+        if (ref.group.position.y >= this.h * 0.95) return false;
+        const dx = ref.group.position.x - gp.x, dz = ref.group.position.z - gp.z;
+        if (dx * dx + dz * dz > reach * reach) return false;
+        return this.startEat(kind, ref, (v) => ref.group.position.copy(v));
+      };
+      let grabbed = false;
+      for (const c of npcs.civilians) { if (tryGrab('civ', c)) { grabbed = true; break; } }
+      if (!grabbed) for (const s of npcs.scouts) { if (tryGrab('scout', s)) { grabbed = true; break; } }
+      if (grabbed) { this.target = null; return; }
+    }
+
     let speed;
     if (this.target) {
       const tp = this.target.kind === 'player' ? player.pos : this.target.ref.group.position;
@@ -433,20 +463,11 @@ class Titan {
       const travel = 1 + (TTUNE.travelMul - 1) * k;
       speed = (this.aggro ? TTUNE.chaseSpeed : 0) * this.speedMul * travel;
 
-      // Snatch NPC prey with the hands when close enough.
-      const dist = Math.hypot(_toP.x, _toP.z);
-      const reach = TTUNE.grabRange + 0.06 * this.h;
-      if (this.target.kind !== 'player' && dist < reach && time > this.attackReadyAt) {
-        const ref = this.target.ref;
-        if (ref.alive && !ref.beingEaten && ref.group.position.y < this.h * 0.95) {
-          this.startEat(this.target.kind, ref, (v) => ref.group.position.copy(v));
-          this.target = null;
-          return;
-        }
-      }
       // Player brushes: the swipe (damage + fling) stays; the full grab-and-eat
       // is driven by the exposure timer in main.
-      if (this.target && this.target.kind === 'player' &&
+      const dist = Math.hypot(_toP.x, _toP.z);
+      const reach = TTUNE.grabRange + 0.06 * this.h;
+      if (this.target.kind === 'player' &&
           dist < reach && player.pos.y < this.h * 0.55 && time > this.attackReadyAt) {
         this.attackReadyAt = time + TTUNE.grabCooldown;
         onGrab(this);
@@ -489,18 +510,19 @@ class Titan {
     this.group.position.x = Math.max(-105, Math.min(105, this.group.position.x));
     this.group.position.z = Math.max(-105, Math.min(104, this.group.position.z));
 
-    // Anti-stuck: if it wants to move (speed>0) but has barely progressed for a
-    // while, it's wedged — pick the clearest escape direction and shove out.
+    // Anti-stuck: only fires when a titan is genuinely wedged — it must have
+    // covered far less ground than its own speed says it should have. The
+    // threshold is RELATIVE to expected travel; a fixed distance would flag a
+    // slow titan lumbering next to its prey as "stuck" and teleport it.
+    const WINDOW = 0.6;
     if (time > this.stuckCheckAt) {
       const moved = this.group.position.distanceTo(this.lastStuckPos);
-      if (speed > 0.5 && moved < 1.2) {
-        this.stuckT += time - (this.stuckCheckAt - 0.5);
-      } else {
-        this.stuckT = 0;
-      }
+      const expected = speed * WINDOW;
+      if (expected > 0.3 && moved < expected * 0.25) this.stuckT += WINDOW;
+      else this.stuckT = 0;
       this.lastStuckPos.copy(this.group.position);
-      this.stuckCheckAt = time + 0.5;
-      if (this.stuckT > 1.4) {
+      this.stuckCheckAt = time + WINDOW;
+      if (this.stuckT >= 1.8) {
         this.escapeStuck(colliders);
         this.stuckT = 0;
         // Head somewhere open and far so it doesn't re-wedge instantly.
@@ -552,11 +574,15 @@ class Titan {
       if (clear > bestClear) { bestClear = clear; bestDir = [dx, dz]; }
     }
     if (bestDir && bestClear > 0) {
-      const step = Math.min(bestClear, 5);
+      // A small nudge, not a teleport — just enough to break the wedge and let
+      // normal walking take over. Big jumps read as the titan glitching.
+      const step = Math.min(bestClear, 1.5);
       gp.x += bestDir[0] * step;
       gp.z += bestDir[1] * step;
       gp.x = Math.max(-105, Math.min(105, gp.x));
       gp.z = Math.max(-105, Math.min(104, gp.z));
+      // Face the escape route so it actually walks out of the gap.
+      this.group.rotation.y = Math.atan2(bestDir[0], bestDir[1]);
     }
   }
 
@@ -915,7 +941,11 @@ export class TitanManager {
   }
 
   // A scout dives the nape. Outcomes: cut/kill, miss, or CAUGHT.
-  scoutCut(t, scout, time) {
+  // `reckless` marks a scout pressing an attack on a titan that ISN'T
+  // distracted — its main purpose is giving the "caught" outcome below a real
+  // chance to fire (previously scouts only ever dove on already-distracted
+  // titans, so a catch could never happen and none were ever eaten).
+  scoutCut(t, scout, time, reckless = false) {
     if (!t.alive) return 'miss';
     t.napeWorld(_n);
     const open = t.eating || time < t.staggerUntil;
@@ -933,7 +963,8 @@ export class TitanManager {
       t.staggerUntil = time + 0.7;
       return 'hit';
     }
-    if (!open && Math.random() < 0.02 && !t.eating) {
+    const catchChance = reckless ? 0.14 : 0.02;
+    if (!open && !t.abnormal && Math.random() < catchChance && !t.eating) {
       if (t.startEat('scout', scout, (v) => scout.group.position.copy(v))) return 'caught';
     }
     return 'miss';
